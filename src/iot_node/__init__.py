@@ -6,6 +6,6 @@ colony, a live status screen, and scheduled upload to Google Drive.
 Developed by Mohammad (Amin) BarzegarTabrizi <mabiran@gmail.com>
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__ = "Mohammad (Amin) BarzegarTabrizi"
 __email__ = "mabiran@gmail.com"

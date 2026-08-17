@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "iot-node"
 authors = [{ name = "Mohammad (Amin) BarzegarTabrizi", email = "mabiran@gmail.com" }]
-version = "0.2.0"
+version = "0.2.1"
 description = "Bee Node: hive sensors, AudioMoth audio, frequency analysis, Google Drive upload"
 requires-python = ">=3.12"
 dependencies = [
