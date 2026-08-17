@@ -22,6 +22,7 @@ configuration that parses without complaint is promoted to the backup.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -104,7 +105,12 @@ class ConfigSync:
             return False
         self._last_fetch = now
 
-        temp = self.cache_dir / f"{CONFIG_NAME}.fetched"
+        # Unique per process: the daemon and any CLI command (`iot-node config`,
+        # `iot-node refresh`) share this state directory, and a fixed temp name
+        # let two concurrent fetches clobber one another — one process deleting
+        # the file the other was about to read, so a stale or partial config
+        # could be adopted while the file on the drive was perfectly fine.
+        temp = self.cache_dir / f"{CONFIG_NAME}.fetched.{os.getpid()}"
         try:
             found = self.backend.download(self.remote_path, temp)
         except UploadError as exc:
@@ -118,6 +124,18 @@ class ConfigSync:
         self.last_success = time.time()
 
         if not found:
+            # Only seed a default when this node has genuinely never had a
+            # config. Otherwise a transient "not found" — a flaky link, a
+            # rename in progress, a throttled request — would overwrite an
+            # operator's timetable with the factory one, on the drive as well
+            # as locally. Losing their settings is far worse than running on
+            # yesterday's copy for a few minutes.
+            if self.cache_path.is_file() or self.backup_path.is_file():
+                log.warning(
+                    "config.ini was not found on the drive, but this node already has "
+                    "one — keeping it rather than overwriting with defaults"
+                )
+                return False
             log.info("no config.ini on the drive — publishing the default for you to edit")
             self._publish_default()
             return True

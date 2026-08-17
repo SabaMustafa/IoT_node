@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -270,3 +271,60 @@ def test_disk_figures_are_recorded(tmp_path):
     writer.record_disk(tmp_path)
     assert writer.status.disk_total_gb > 0
     assert 0 <= writer.status.disk_free_pct <= 100
+
+
+# --- concurrency and destructive-fallback guards ------------------------------
+
+
+def test_concurrent_fetches_do_not_share_a_temp_file(tmp_path):
+    """The daemon and a CLI command both fetch into the same state directory.
+
+    With a fixed temp name they clobbered each other: one process deleted the
+    file the other was about to read, so a stale config could be adopted while
+    the drive copy was perfectly fine.
+    """
+    backend = FakeBackend({"IoT/config.ini": GOOD_INI})
+    a = ConfigSync(backend, "IoT", tmp_path / "state")
+    b = ConfigSync(backend, "IoT", tmp_path / "state")
+
+    seen: list[Path] = []
+    original = backend.download
+
+    def spy(remote_path, local_path):
+        seen.append(Path(local_path))
+        return original(remote_path, local_path)
+
+    backend.download = spy
+    a.refresh(force=True)
+    b.refresh(force=True)
+
+    assert len(seen) == 2
+    # Same directory is fine; the same *name* is not.
+    assert seen[0].parent == seen[1].parent
+    assert str(os.getpid()) in seen[0].name
+
+
+def test_a_missing_remote_config_never_overwrites_an_existing_one(tmp_path):
+    """A transient 'not found' must not destroy the operator's timetable."""
+    backend = FakeBackend({"IoT/config.ini": OTHER_INI})
+    sync = ConfigSync(backend, "IoT", tmp_path / "state")
+    sync.refresh(force=True)
+    assert sync.config.sample_rate == 96000
+
+    # The drive momentarily reports the file as absent.
+    del backend.files["IoT/config.ini"]
+    uploads_before = len(backend.uploaded)
+    changed = sync.refresh(force=True)
+
+    assert changed is False
+    assert sync.config.sample_rate == 96000        # settings untouched
+    assert len(backend.uploaded) == uploads_before  # nothing written to the drive
+    assert "sample_rate = 96000" in sync.cache_path.read_text()
+
+
+def test_the_default_is_still_seeded_on_a_genuinely_fresh_node(tmp_path):
+    backend = FakeBackend()
+    sync = ConfigSync(backend, "IoT", tmp_path / "state")
+
+    assert sync.refresh(force=True) is True
+    assert "IoT/config.ini" in backend.files
