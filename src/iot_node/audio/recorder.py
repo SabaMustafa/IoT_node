@@ -107,6 +107,60 @@ def find_audiomoth(arecord: str = "arecord") -> CaptureDevice | None:
     return None
 
 
+# AudioMoth is built on a Silicon Labs EFM32, so anything it presents over USB
+# carries this vendor id whatever firmware or switch position it is in.
+_AUDIOMOTH_USB_VENDORS = ("10c4",)
+
+
+def audiomoth_usb_present() -> bool | None:
+    """Is an AudioMoth on the USB bus at all, whatever mode it is in?
+
+    This separates the two failure modes that look identical from ALSA's point
+    of view: nothing plugged in, versus plugged in but not presenting itself as
+    a microphone (stock firmware, wrong switch position, charge-only cable).
+    Returns None if the question cannot be answered on this system.
+    """
+    root = Path("/sys/bus/usb/devices")
+    if not root.is_dir():
+        return None
+    try:
+        for entry in root.iterdir():
+            vendor_file = entry / "idVendor"
+            if not vendor_file.is_file():
+                continue
+            if vendor_file.read_text().strip().lower() in _AUDIOMOTH_USB_VENDORS:
+                return True
+    except OSError:
+        return None
+    return False
+
+
+def diagnose_missing_audiomoth(arecord: str = "arecord") -> str:
+    """Explain *why* there is no AudioMoth to record from."""
+    try:
+        devices = list_capture_devices(arecord)
+    except RecorderError as exc:
+        return str(exc)
+
+    on_bus = audiomoth_usb_present()
+    others = ", ".join(d.name for d in devices) or "none"
+
+    if on_bus is False:
+        return (
+            "no AudioMoth is plugged in — nothing from its chip family is on the USB "
+            f"bus at all. Capture devices present: {others}. Check the cable is a data "
+            "cable, not charge-only."
+        )
+    if on_bus is True:
+        return (
+            "an AudioMoth is plugged in but is not offering itself as a microphone. "
+            "Set the switch to USB/OFF, and make sure it is running "
+            "AudioMoth-USB-Microphone firmware — the stock Basic firmware only talks "
+            "to the configuration app."
+        )
+    return f"no AudioMoth capture device found. Capture devices present: {others}."
+
+
 def select_device(preference: str = "auto", arecord: str = "arecord") -> CaptureDevice | None:
     """Resolve the ``input_device`` setting to a capture device.
 

@@ -33,6 +33,7 @@ from .audio import AudioIngest, find_audiomoth_mounts, parse_audiomoth_config
 from .audio.recorder import (
     Recorder,
     RecorderError,
+    diagnose_missing_audiomoth,
     list_capture_devices,
     probe_sample_rates,
     select_device,
@@ -389,10 +390,7 @@ class Node:
         try:
             device = recorder.detect()
             if device is None:
-                raise RecorderError(
-                    "no capture device found — is the AudioMoth switched to USB/OFF "
-                    "and plugged into a data cable?"
-                )
+                raise RecorderError(diagnose_missing_audiomoth())
             path = recorder.record(sample_rate=self.settings.sample_rate, seconds=seconds)
             result = analyse_wav(
                 path,

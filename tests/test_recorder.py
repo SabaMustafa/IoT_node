@@ -216,3 +216,57 @@ def test_failed_arecord_leaves_nothing_behind(monkeypatch, tmp_path):
         recorder.record(sample_rate=48000, seconds=1)
 
     assert list(output.glob("*")) == []
+
+
+# --- "is it really the AudioMoth?" -------------------------------------------
+
+
+def test_auto_refuses_a_substitute_device(monkeypatch):
+    """The guarantee: an AudioMoth or nothing, never a stand-in.
+
+    Recording a webcam for a week and filing it as hive audio is worse than
+    recording nothing, because nothing is obviously wrong and bad data is not.
+    """
+    from iot_node.audio.recorder import select_device
+
+    listing = "card 2: CAMERA [USB CAMERA], device 0: USB Audio [USB Audio]\n"
+    fake_run(monkeypatch, ok(listing))
+
+    assert select_device("auto") is None
+    # 'any' is the explicit bench-testing opt-in, and does substitute.
+    assert select_device("any") is not None
+
+
+def test_any_still_prefers_a_real_audiomoth(monkeypatch):
+    from iot_node.audio.recorder import select_device
+
+    fake_run(monkeypatch, ok(ARECORD_L))
+    device = select_device("any")
+    assert device is not None and device.is_audiomoth
+
+
+def test_explicit_alsa_name_is_honoured(monkeypatch):
+    from iot_node.audio.recorder import select_device
+
+    fake_run(monkeypatch, ok(ARECORD_L))
+    device = select_device("hw:2,0")
+    assert device is not None and device.card == 2
+
+
+def test_diagnosis_distinguishes_absent_from_wrong_mode(monkeypatch):
+    """Two failures look identical to ALSA and need different fixes."""
+    import iot_node.audio.recorder as rec
+
+    fake_run(monkeypatch, ok("card 2: CAMERA [USB CAMERA], device 0: USB Audio [x]\n"))
+
+    monkeypatch.setattr(rec, "audiomoth_usb_present", lambda: False)
+    absent = rec.diagnose_missing_audiomoth()
+    assert "on the USB bus at all" in absent
+    assert "charge-only" in absent  # the usual culprit when it is plugged in
+
+    monkeypatch.setattr(rec, "audiomoth_usb_present", lambda: True)
+    message = rec.diagnose_missing_audiomoth()
+    assert "USB/OFF" in message and "firmware" in message
+
+    monkeypatch.setattr(rec, "audiomoth_usb_present", lambda: None)
+    assert "USB CAMERA" in rec.diagnose_missing_audiomoth()
