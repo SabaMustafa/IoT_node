@@ -107,9 +107,20 @@ def find_audiomoth(arecord: str = "arecord") -> CaptureDevice | None:
     return None
 
 
-# AudioMoth is built on a Silicon Labs EFM32, so anything it presents over USB
-# carries this vendor id whatever firmware or switch position it is in.
-_AUDIOMOTH_USB_VENDORS = ("10c4",)
+# An AudioMoth presents two different USB identities depending on the switch,
+# and both were observed on real hardware:
+#
+#   10c4:0002  Silicon Labs USBXpress, interface class 03 (HID)
+#              — the USB/OFF position: configuration mode, talks to the
+#                AudioMoth app, and is NOT a recording device
+#   16d0:06f3  MCS "384kHz AudioMoth USB Microphone", interface class 01
+#              — the DEFAULT/CUSTOM position: an actual USB audio device
+#
+# Matching on the vendor id alone would miss the microphone mode entirely, so
+# the product string is the reliable signal and the ids are a fallback for a
+# device whose strings cannot be read.
+_AUDIOMOTH_USB_VENDORS = ("10c4", "16d0")
+_AUDIOMOTH_PRODUCT_HINT = "audiomoth"
 
 
 def audiomoth_usb_present() -> bool | None:
@@ -117,22 +128,33 @@ def audiomoth_usb_present() -> bool | None:
 
     This separates the two failure modes that look identical from ALSA's point
     of view: nothing plugged in, versus plugged in but not presenting itself as
-    a microphone (stock firmware, wrong switch position, charge-only cable).
+    a microphone (configuration switch position, or stock firmware).
     Returns None if the question cannot be answered on this system.
     """
     root = Path("/sys/bus/usb/devices")
     if not root.is_dir():
         return None
+    found = False
     try:
         for entry in root.iterdir():
+            product = entry / "product"
+            if product.is_file():
+                try:
+                    if _AUDIOMOTH_PRODUCT_HINT in product.read_text().strip().lower():
+                        return True
+                except OSError:
+                    pass
             vendor_file = entry / "idVendor"
             if not vendor_file.is_file():
                 continue
-            if vendor_file.read_text().strip().lower() in _AUDIOMOTH_USB_VENDORS:
-                return True
+            try:
+                if vendor_file.read_text().strip().lower() in _AUDIOMOTH_USB_VENDORS:
+                    found = True
+            except OSError:
+                continue
     except OSError:
         return None
-    return False
+    return found
 
 
 def diagnose_missing_audiomoth(arecord: str = "arecord") -> str:
@@ -153,10 +175,12 @@ def diagnose_missing_audiomoth(arecord: str = "arecord") -> str:
         )
     if on_bus is True:
         return (
-            "an AudioMoth is plugged in but is not offering itself as a microphone. "
-            "Set the switch to USB/OFF, and make sure it is running "
-            "AudioMoth-USB-Microphone firmware — the stock Basic firmware only talks "
-            "to the configuration app."
+            "an AudioMoth is plugged in but is offering a configuration interface "
+            "rather than audio (USB interface class 03/HID, not 01/Audio). Move the "
+            "switch to the other position — DEFAULT or CUSTOM makes it a microphone, "
+            "USB/OFF is the mode the configuration app uses — and replug. If neither "
+            "position gives an audio device, it needs AudioMoth-USB-Microphone "
+            "firmware."
         )
     return f"no AudioMoth capture device found. Capture devices present: {others}."
 

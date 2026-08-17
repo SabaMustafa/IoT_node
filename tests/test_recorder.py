@@ -266,7 +266,41 @@ def test_diagnosis_distinguishes_absent_from_wrong_mode(monkeypatch):
 
     monkeypatch.setattr(rec, "audiomoth_usb_present", lambda: True)
     message = rec.diagnose_missing_audiomoth()
-    assert "USB/OFF" in message and "firmware" in message
+    # Observed on real hardware: the AudioMoth USB Microphone enumerates as
+    # 10c4:0002 with interface class 03 (HID) in the USB/OFF position, which is
+    # the configuration mode — so the advice must be to move the switch, not to
+    # select USB/OFF.
+    assert "DEFAULT" in message and "CUSTOM" in message
+    assert "firmware" in message
 
     monkeypatch.setattr(rec, "audiomoth_usb_present", lambda: None)
     assert "USB CAMERA" in rec.diagnose_missing_audiomoth()
+
+
+def test_usb_detection_knows_both_audiomoth_identities(tmp_path, monkeypatch):
+    """Observed on real hardware — the ids differ by switch position.
+
+    10c4:0002 is the configuration (HID) mode; 16d0:06f3 is the microphone.
+    Matching only the first reported "not plugged in" while it was plugged in.
+    """
+    import iot_node.audio.recorder as rec
+
+    def fake_bus(entries: list[tuple[str, str]]):
+        root = tmp_path / f"bus{len(entries)}{entries[0][0]}"
+        for index, (vendor, product) in enumerate(entries):
+            device = root / f"3-{index}"
+            device.mkdir(parents=True)
+            (device / "idVendor").write_text(vendor + "\n")
+            if product:
+                (device / "product").write_text(product + "\n")
+        monkeypatch.setattr(rec, "Path", lambda _p: root)
+        return root
+
+    fake_bus([("16d0", "384kHz AudioMoth USB Microphone")])
+    assert rec.audiomoth_usb_present() is True
+
+    fake_bus([("10c4", "AudioMoth")])
+    assert rec.audiomoth_usb_present() is True
+
+    fake_bus([("0bda", "USB CAMERA")])
+    assert rec.audiomoth_usb_present() is False
