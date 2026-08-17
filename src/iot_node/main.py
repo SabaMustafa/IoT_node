@@ -91,6 +91,7 @@ class Node:
         self._recording = threading.Event()
         self._last_upload = 0.0
         self._analysed: list[float] = []
+        self._recording_started = 0.0
 
     # Built lazily so a credential problem cannot stop the sensors from running.
     @property
@@ -206,6 +207,11 @@ class Node:
             return
 
         self._recording.set()
+        self._recording_started = time.monotonic()
+        self.status.update(
+            recording_total_s=self.settings.recording_minutes * 60,
+            recording_elapsed_s=0.0,
+        )
         worker = threading.Thread(target=self._record_once, name="recorder", daemon=True)
         worker.start()
 
@@ -273,8 +279,12 @@ class Node:
             last_recording_utc=result.analysed_at,
             dominant_hz=result.dominant_hz,
             rms_dbfs=result.rms_dbfs,
+            peak_dbfs=result.peak_dbfs,
             spl_estimate_db=result.spl_estimate_db,
             audio_device=result.device,
+            analysis_min_hz=result.band_min_hz,
+            analysis_max_hz=result.band_max_hz,
+            analysed_today=len(self._analysed),
             peaks=[
                 {"hz": round(p.frequency_hz, 1), "db": round(p.amplitude_db, 1)}
                 for p in result.peaks
@@ -348,6 +358,11 @@ class Node:
             sensors_on_now=self.settings.logs_sensors_at(hour),
             microphone_on_now=self.settings.records_audio_at(hour),
             recording_now=self._recording.is_set(),
+            recording_elapsed_s=(
+                time.monotonic() - self._recording_started
+                if self._recording.is_set() and self._recording_started
+                else 0.0
+            ),
             sensor_hours=[int(f) for f in self.settings.sensor_hours],
             microphone_hours=[int(f) for f in self.settings.microphone_hours],
             sample_rate=self.settings.sample_rate,

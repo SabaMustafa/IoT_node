@@ -88,6 +88,12 @@ class Status:
     spl_estimate_db: float | None = None
     peaks: list[dict[str, float]] = field(default_factory=list)
     audio_device: str = ""
+    peak_dbfs: float | None = None
+    analysis_min_hz: float = 20.0
+    analysis_max_hz: float = 2000.0
+    recording_elapsed_s: float = 0.0
+    recording_total_s: float = 0.0
+    analysed_today: int = 0
 
     # Schedule
     hour: int = 0

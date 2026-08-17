@@ -173,6 +173,187 @@ class Dashboard:
         if unit:
             self._text(right + 10, bottom - 20, unit, size=13, fill=MUTED)
 
+    def _acoustics(self, x: int, y: int, w: int, h: int, status: Status) -> None:
+        """The hive's sound: where its energy sits, and how loud it is.
+
+        The spectrum is the point of the panel. A colony's fundamental normally
+        sits near 200-250 Hz, and a shift in where the energy lies is the thing
+        a beekeeper actually wants to notice — so the peaks are drawn on a real
+        frequency axis rather than listed as numbers, which makes a change in
+        distribution visible at a glance from across a room.
+        """
+        self._panel(x, y, w, h, "hive acoustics")
+
+        if status.rms_dbfs is None:
+            self._acoustics_waiting(x, y, w, h, status)
+            return
+
+        # --- headline figures ---
+        dominant = f"{status.dominant_hz:.0f}" if status.dominant_hz else "—"
+        self._text(x + 16, y + 34, dominant, size=38, fill=AMBER, bold=True)
+        self._text(x + 16, y + 84, "Hz dominant", size=11, fill=MUTED)
+
+        calibrated = (
+            status.spl_estimate_db is not None
+            and abs(status.spl_estimate_db - status.rms_dbfs) > 0.01
+        )
+        level = status.spl_estimate_db if calibrated else status.rms_dbfs
+        level_x = x + int(w * 0.26)
+        self._text(level_x, y + 34, f"{level:.1f}", size=38, fill=INK, bold=True)
+        self._text(
+            level_x, y + 84,
+            "dB SPL (calibrated)" if calibrated else "dBFS · uncalibrated",
+            size=11, fill=MUTED,
+        )
+
+        # Level meter: dBFS runs -90..0, so map that to the bar.
+        meter_x = x + int(w * 0.52)
+        meter_w = w - (meter_x - x) - 20
+        self._level_meter(meter_x, y + 40, meter_w, 16, status.rms_dbfs, status.peak_dbfs)
+        self._text(meter_x, y + 62, "-90", size=8, fill=MUTED)
+        self._text(meter_x + meter_w, y + 62, "0 dBFS", size=8, fill=MUTED, anchor="ne")
+        if len(status.history_db) > 1:
+            self._text(meter_x, y + 84, "level trend", size=9, fill=MUTED)
+            self._sparkline(meter_x + 74, y + 76, meter_w - 74, 18, status.history_db[-40:], INK)
+
+        # --- spectrum ---
+        spec_y = y + 112
+        spec_h = max(56, int(h - 112 - 44))
+        self._spectrum(x + 16, spec_y, w - 32, spec_h, status)
+
+        # --- provenance ---
+        when = status.last_recording_utc[11:19] if len(status.last_recording_utc) > 18 else ""
+        footer = status.last_recording or "—"
+        if when:
+            footer += f"  ·  analysed {when}Z"
+        if status.analysed_today:
+            footer += f"  ·  {status.analysed_today} today"
+        self._text(x + 16, y + h - 30, footer[:70], size=9, fill=MUTED)
+        if status.audio_device:
+            bench = "AudioMoth" not in status.audio_device
+            self._text(
+                x + w - 16, y + h - 30,
+                (("⚠ bench input: " if bench else "") + status.audio_device)[:52],
+                size=9, fill=WARN if bench else MUTED, anchor="ne",
+            )
+
+    def _acoustics_waiting(self, x: int, y: int, w: int, h: int, status: Status) -> None:
+        """Say what is happening instead of just 'nothing yet'."""
+        if status.recording_now and status.recording_total_s:
+            remaining = max(0.0, status.recording_total_s - status.recording_elapsed_s)
+            done = status.recording_elapsed_s / status.recording_total_s
+            self._text(x + 16, y + 40, "RECORDING", size=26, fill=BAD, bold=True)
+            self._text(
+                x + 16, y + 78,
+                f"{int(remaining) // 60}:{int(remaining) % 60:02d} remaining "
+                f"of {int(status.recording_total_s) // 60} min  ·  analysis follows",
+                size=12, fill=MUTED,
+            )
+            bar_w = w - 32
+            self.canvas.create_rectangle(
+                x + 16, y + 108, x + 16 + bar_w, y + 122, outline=LINE, fill=BG
+            )
+            self.canvas.create_rectangle(
+                x + 16, y + 108, x + 16 + bar_w * min(1.0, done), y + 122,
+                fill=BAD, outline="",
+            )
+        elif status.microphone_on_now:
+            self._text(x + 16, y + 44, "waiting to record this hour",
+                       size=15, fill=MUTED)
+        else:
+            nxt = [
+                hour for hour in list(range(status.hour, 24)) + list(range(status.hour))
+                if hour < len(status.microphone_hours) and status.microphone_hours[hour]
+            ]
+            when = f"{nxt[0]:02d}:00" if nxt else "never — microphone is off"
+            self._text(x + 16, y + 44, "no recording analysed yet", size=15, fill=MUTED)
+            self._text(x + 16, y + 74, f"next scheduled recording at {when}",
+                       size=12, fill=MUTED)
+        self._text(
+            x + 16, y + h - 30,
+            f"analysis band {status.analysis_min_hz:g}-{status.analysis_max_hz:g} Hz",
+            size=9, fill=MUTED,
+        )
+
+    def _level_meter(
+        self, x: float, y: float, w: float, h: float,
+        rms: float, peak: float | None,
+    ) -> None:
+        def frac(db: float) -> float:
+            return max(0.0, min(1.0, (db + 90.0) / 90.0))
+
+        self.canvas.create_rectangle(x, y, x + w, y + h, outline=LINE, fill=BG)
+        filled = frac(rms) * w
+        # Green up to about -12 dBFS, amber approaching full scale, red at it:
+        # a recording pinned at 0 dBFS is clipped and its peaks are unusable.
+        colour = GOOD if rms < -18 else (WARN if rms < -6 else BAD)
+        self.canvas.create_rectangle(x, y, x + filled, y + h, fill=colour, outline="")
+        if peak is not None:
+            px = x + frac(peak) * w
+            self.canvas.create_line(px, y - 2, px, y + h + 2, fill=INK, width=2)
+            if peak >= -0.5:  # sitting on full scale
+                self._text(x + w, y - 16, "CLIPPING", size=9, fill=BAD, anchor="ne", bold=True)
+
+    def _spectrum(self, x: float, y: float, w: float, h: float, status: Status) -> None:
+        """Peaks drawn on a logarithmic frequency axis.
+
+        Log spacing because hearing and hive acoustics are both ratio-based:
+        the difference between 200 and 400 Hz matters far more than between
+        1600 and 1800, and a linear axis would crush everything interesting
+        into the leftmost tenth of the panel.
+        """
+        import math
+
+        low = max(10.0, status.analysis_min_hz or 20.0)
+        high = max(low * 2, status.analysis_max_hz or 2000.0)
+        log_low, log_high = math.log10(low), math.log10(high)
+
+        def position(hz: float) -> float:
+            hz = max(low, min(high, hz))
+            return x + (math.log10(hz) - log_low) / (log_high - log_low) * w
+
+        baseline = y + h - 16
+        self.canvas.create_line(x, baseline, x + w, baseline, fill=LINE)
+
+        # Decade and half-decade gridlines, labelled.
+        for grid_hz in (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000):
+            if not low <= grid_hz <= high:
+                continue
+            gx = position(grid_hz)
+            self.canvas.create_line(gx, y, gx, baseline, fill=LINE, dash=(2, 4))
+            label = f"{grid_hz // 1000}k" if grid_hz >= 1000 else str(grid_hz)
+            self._text(gx, baseline + 2, label, size=8, fill=MUTED, anchor="n")
+
+        peaks = status.peaks[:8]
+        if not peaks:
+            return
+        levels = [float(p.get("db", -90)) for p in peaks]
+        top = max(levels)
+        # Show at least a 24 dB range, so a set of near-equal peaks does not
+        # get stretched into dramatic-looking differences.
+        bottom = min(min(levels), top - 24.0)
+        span = max(6.0, top - bottom)
+
+        for index, peak in enumerate(peaks):
+            hz = float(peak.get("hz", 0))
+            db = float(peak.get("db", -90))
+            px = position(hz)
+            height = max(3.0, (db - bottom) / span * (h - 34))
+            colour = AMBER if index == 0 else HONEY if index < 3 else MUTED
+            self.canvas.create_rectangle(
+                px - 4, baseline - height, px + 4, baseline, fill=colour, outline=""
+            )
+            # Label the strongest few; more than that becomes unreadable.
+            if index < 3:
+                self._text(
+                    px, baseline - height - 15, f"{hz:.0f}",
+                    size=10, fill=colour, bold=True, anchor="n",
+                )
+                self._text(
+                    px, baseline - height - 2, f"{db:.0f}dB",
+                    size=8, fill=MUTED, anchor="n",
+                )
+
     def _refresh_button(self, x: float, y: float) -> None:
         """A clickable 'refresh config' control, with a transient confirmation."""
         w, h = 174.0, 30.0
@@ -285,49 +466,7 @@ class Dashboard:
 
         # --- acoustics ---
         panel_w = int(column * 2 + margin)
-        self._panel(margin, lower_y, panel_w, lower_h, "hive acoustics")
-        if status.rms_dbfs is None:
-            self._text(margin + 16, lower_y + 52, "no recording analysed yet",
-                       size=14, fill=MUTED)
-        else:
-            dominant = f"{status.dominant_hz:.0f}" if status.dominant_hz else "—"
-            self._text(margin + 16, lower_y + 40, dominant, size=34, fill=AMBER, bold=True)
-            self._text(margin + 16, lower_y + 88, "Hz dominant", size=11, fill=MUTED)
-
-            level = (
-                status.spl_estimate_db
-                if status.spl_estimate_db is not None
-                else status.rms_dbfs
-            )
-            level_x = margin + int(panel_w * 0.28)
-            self._text(level_x, lower_y + 40, f"{level:.1f}", size=34, fill=INK, bold=True)
-            self._text(
-                level_x, lower_y + 88,
-                "dB (est.)" if status.spl_estimate_db != status.rms_dbfs
-                else "dBFS (uncalibrated)",
-                size=11, fill=MUTED,
-            )
-            if status.audio_device:
-                self._text(margin + 16, lower_y + lower_h - 22,
-                           status.audio_device[:60], size=9, fill=MUTED)
-
-            # Peak table, sized to whatever room the panel has.
-            rows_top = lower_y + 118
-            row_h = max(16, min(28, int((lower_h - 150) / max(1, len(status.peaks)))))
-            for index, peak in enumerate(status.peaks[:5]):
-                y = rows_top + index * row_h
-                hz = peak.get("hz", 0)
-                db = peak.get("db", 0)
-                self._text(margin + 16, y, f"{index + 1}.", size=10, fill=MUTED)
-                self._text(margin + 44, y, f"{hz:>7.0f} Hz", size=11, fill=INK, mono=True)
-                self._text(margin + 140, y, f"{db:>6.1f} dB", size=11, fill=MUTED, mono=True)
-                # Bar proportional to level, floored at -90 dB.
-                bar = max(0.0, min(1.0, (db + 90) / 90))
-                bar_x = margin + 240
-                self.canvas.create_rectangle(
-                    bar_x, y + 3, bar_x + bar * (panel_w - 270), y + row_h - 6,
-                    fill=AMBER, outline="",
-                )
+        self._acoustics(margin, lower_y, panel_w, lower_h, status)
 
         # --- schedule ---
         schedule_x = int(margin * 3 + column * 2)
