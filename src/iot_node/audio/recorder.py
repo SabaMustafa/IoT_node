@@ -234,6 +234,11 @@ class Recorder:
         self._channels: int | None = None
         self._process: subprocess.Popen[bytes] | None = None
         self._warned_substitute = False
+        # The .part file currently being written, so a live meter can read
+        # its tail — the capture device itself can only be opened once.
+        self.active_partial: Path | None = None
+        self.active_rate = 0
+        self.active_channels = 1
 
     def set_preference(self, preference: str) -> None:
         """Change the configured input device, re-detecting if it differs."""
@@ -354,6 +359,7 @@ class Recorder:
         log.info(
             "recording %.0fs at %d Hz, %d ch, from %s", seconds, rate, channels, device.name
         )
+        self.active_partial, self.active_rate, self.active_channels = partial, rate, channels
         try:
             self._process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             _, stderr = self._process.communicate(timeout=seconds + 60)
@@ -365,6 +371,7 @@ class Recorder:
             raise RecorderError(f"could not start arecord: {exc}") from exc
         finally:
             self._process = None
+            self.active_partial = None
 
         if returncode != 0:
             partial.unlink(missing_ok=True)

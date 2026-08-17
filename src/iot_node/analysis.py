@@ -296,6 +296,52 @@ def analyse_wav(
     )
 
 
+def tail_level_dbfs(
+    path: Path, *, window_s: float = 1.0, rate: int = 48000, channels: int = 1,
+    width: int = 2, header_bytes: int = 44,
+) -> float | None:
+    """Level of the last ``window_s`` of a WAV that is still being written.
+
+    Used for the live meter: arecord is writing the file, so rather than open a
+    second stream on a device that only allows one, we read the tail of what it
+    has already written. Returns None while there is not yet enough audio.
+    """
+    frame = max(1, width * channels)
+    want = int(rate * window_s) * frame
+    try:
+        size = path.stat().st_size
+        if size <= header_bytes + frame:
+            return None
+        start = max(header_bytes, size - want)
+        # Never start mid-frame, or the samples decode as noise.
+        start -= (start - header_bytes) % frame
+        with path.open("rb") as handle:
+            handle.seek(start)
+            raw = handle.read(min(want, size - start))
+    except OSError:
+        return None
+
+    usable = (len(raw) // frame) * frame
+    if usable < frame:
+        return None
+
+    dtype: str | None = {1: "u1", 2: "<i2", 4: "<i4"}.get(width)
+    if dtype is None:
+        return None
+    samples = np.frombuffer(raw[:usable], dtype=dtype).astype(np.float32)
+    if width == 1:
+        samples = (samples - 128.0) / 128.0
+    elif width == 2:
+        samples /= 32768.0
+    else:
+        samples /= 2147483648.0
+
+    if samples.size == 0:
+        return None
+    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+    return float(_to_db(rms))
+
+
 def clipping_fraction(path: Path, threshold: float = 0.99) -> float:
     """Fraction of samples at full scale — a clipped recording is unusable."""
     try:

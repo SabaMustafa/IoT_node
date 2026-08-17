@@ -28,7 +28,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .analysis import AnalysisError, analyse_wav, analysis_columns
+from .analysis import AnalysisError, analyse_wav, analysis_columns, tail_level_dbfs
 from .audio import AudioIngest, find_audiomoth_mounts, parse_audiomoth_config
 from .audio.recorder import (
     Recorder,
@@ -48,7 +48,14 @@ from .logging_setup import setup_logging
 from .remote_config import RemoteConfig
 from .sensors.manager import SensorManager
 from .state import Store
-from .status import StatusWriter, request_refresh, take_refresh_request
+from .status import (
+    Status,
+    StatusWriter,
+    request_mic_test,
+    request_refresh,
+    take_mic_test_request,
+    take_refresh_request,
+)
 
 log = logging.getLogger("iot_node")
 
@@ -214,6 +221,35 @@ class Node:
         )
         worker = threading.Thread(target=self._record_once, name="recorder", daemon=True)
         worker.start()
+        self._start_level_monitor()
+
+    def _start_level_monitor(self) -> None:
+        """Publish the input level once a second while recording.
+
+        Reads the tail of the file arecord is writing rather than opening the
+        device again — ALSA allows only one reader, so a second stream would
+        simply fail.
+        """
+        def monitor() -> None:
+            while self._recording.is_set() and not self._stop.is_set():
+                partial = self.recorder.active_partial
+                if partial is not None:
+                    level = tail_level_dbfs(
+                        partial,
+                        window_s=1.0,
+                        rate=self.recorder.active_rate or self.settings.sample_rate,
+                        channels=self.recorder.active_channels or 1,
+                    )
+                    if level is not None:
+                        self.status.update(live_db=round(level, 1))
+                        self.status.push_history(live_db=level)
+                        self.status.publish()
+                self._stop.wait(1.0)
+            # Leave the meter empty rather than frozen on the last value.
+            self.status.update(live_db=None)
+            self.status.publish()
+
+        threading.Thread(target=monitor, name="level-monitor", daemon=True).start()
 
     def _record_once(self) -> None:
         try:
@@ -292,6 +328,123 @@ class Node:
         )
         self.status.push_history(db=result.rms_dbfs)
 
+    def start_mic_test(self, seconds: float) -> None:
+        """Record a few seconds now and report what was heard, and from where.
+
+        The point is to answer "is it really listening to the AudioMoth?" —
+        so the result names the device explicitly and flags anything that is
+        not one, rather than just showing a level and leaving the operator to
+        assume.
+        """
+        if self._recording.is_set():
+            # The microphone can only be opened once, and with an hourly
+            # timetable a scheduled recording is often already running. Rather
+            # than refuse — which answers nothing — report on the recording
+            # that is happening, which is the same device and the same signal
+            # the operator wanted to check.
+            device = self.recorder.device
+            self.status.update(
+                mic_test_state="ok" if device else "failed",
+                mic_test_message=(
+                    "reporting on the scheduled recording already in progress"
+                    if device else "a recording is starting; try again in a moment"
+                ),
+                mic_test_device=str(device) if device else "",
+                mic_test_is_audiomoth=bool(device and device.is_audiomoth),
+                mic_test_rate=self.recorder.active_rate or self.settings.sample_rate,
+                mic_test_channels=self.recorder.active_channels or 1,
+                mic_test_rms_dbfs=self.status.status.live_db,
+                mic_test_peak_dbfs=None,
+                mic_test_dominant_hz=None,
+                mic_test_peaks=[],
+                mic_test_seconds=self.status.status.recording_elapsed_s,
+                mic_test_at=_utc_now(),
+                mic_test_epoch=time.time(),
+            )
+            self.status.publish()
+            log.info("mic test: reported on the in-progress recording (%s)", device)
+            return
+
+        self._recording.set()
+        self.status.update(
+            mic_test_state="running",
+            mic_test_message=f"recording {seconds:g}s…",
+            mic_test_seconds=seconds,
+            mic_test_at=_utc_now(),
+            mic_test_epoch=time.time(),
+        )
+        self.status.publish()
+        threading.Thread(
+            target=self._mic_test, args=(seconds,), name="mic-test", daemon=True
+        ).start()
+        self._start_level_monitor()
+
+    def _mic_test(self, seconds: float) -> None:
+        scratch = self.cfg.resolve("var/state") / "mic-test"
+        recorder = Recorder(
+            scratch, device_id=self.cfg.device.id, preference=self.settings.input_device
+        )
+        # The meter watches self.recorder, so point it at this one for the test.
+        scheduled, self.recorder = self.recorder, recorder
+        try:
+            device = recorder.detect()
+            if device is None:
+                raise RecorderError(
+                    "no capture device found — is the AudioMoth switched to USB/OFF "
+                    "and plugged into a data cable?"
+                )
+            path = recorder.record(sample_rate=self.settings.sample_rate, seconds=seconds)
+            result = analyse_wav(
+                path,
+                top_peaks=self.settings.top_peaks,
+                min_hz=self.settings.analysis_min_hz,
+                max_hz=self.settings.analysis_max_hz,
+                device=str(device),
+            )
+            silent = result.rms_dbfs < -70
+            clipped = result.peak_dbfs >= -0.5
+            message = (
+                "SILENT — the device is being read but no sound is reaching it"
+                if silent
+                else "CLIPPING — the input is too hot to analyse"
+                if clipped
+                else "microphone is working"
+            )
+            self.status.update(
+                mic_test_state="ok",
+                mic_test_message=message,
+                mic_test_device=str(device),
+                mic_test_is_audiomoth=device.is_audiomoth,
+                mic_test_rate=result.sample_rate,
+                mic_test_channels=recorder.usable_channels(),
+                mic_test_rms_dbfs=result.rms_dbfs,
+                mic_test_peak_dbfs=result.peak_dbfs,
+                mic_test_dominant_hz=result.dominant_hz,
+                mic_test_peaks=[
+                    {"hz": round(p.frequency_hz, 1), "db": round(p.amplitude_db, 1)}
+                    for p in result.peaks
+                ],
+                mic_test_seconds=result.duration_s,
+                mic_test_at=_utc_now(),
+                mic_test_epoch=time.time(),
+            )
+            log.info(
+                "mic test: %s via %s — %s", message, device, result.summary()
+            )
+            path.unlink(missing_ok=True)
+        except (RecorderError, AnalysisError, OSError) as exc:
+            log.error("mic test failed: %s", exc)
+            self.status.update(
+                mic_test_state="failed",
+                mic_test_message=str(exc)[:160],
+                mic_test_at=_utc_now(),
+                mic_test_epoch=time.time(),
+            )
+        finally:
+            self.recorder = scheduled
+            self._recording.clear()
+            self.status.publish()
+
     def task_audio_ingest(self) -> None:
         """Pick up anything written to a mounted AudioMoth card."""
         staged = self.audio.scan()
@@ -338,6 +491,11 @@ class Node:
         # Checked here rather than in task_config because this runs every few
         # seconds: an operator who has just edited config.ini should see the
         # change take effect while they are still looking at the screen.
+        requested = take_mic_test_request(self.cfg.resolve("var/state"))
+        if requested is not None:
+            log.info("microphone test requested (%.0fs)", requested)
+            self.start_mic_test(requested)
+
         if take_refresh_request(self.cfg.resolve("var/state")):
             log.info("config refresh requested")
             sync = self.sync
@@ -724,6 +882,59 @@ def cmd_refresh(cfg: Config) -> int:
     return 0
 
 
+def cmd_mic_test(cfg: Config, *, seconds: float = 5.0) -> int:
+    """Ask the running node to record a few seconds and report on the input."""
+    from .status import read_status
+
+    state_dir = cfg.resolve("var/state")
+    if not request_mic_test(state_dir, seconds):
+        return 1
+    print(f"microphone test requested ({seconds:g}s) — waiting for the node…")
+
+    status_path = state_dir / "status.json"
+    deadline = time.monotonic() + seconds + 60
+    seen_running = False
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        status = read_status(status_path)
+        if status is None or status.mic_test_age_s() > 120:
+            continue
+        if status.mic_test_state == "running":
+            seen_running = True
+            continue
+        if status.mic_test_state in ("ok", "failed") and seen_running:
+            return _print_mic_test(status)
+
+    print(
+        "no response from the node. Is it running?  systemctl status iot-node",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _print_mic_test(status: Status) -> int:
+    if status.mic_test_state != "ok":
+        print(f"\nFAILED: {status.mic_test_message}", file=sys.stderr)
+        return 1
+
+    print(f"\n  device      {status.mic_test_device}")
+    print(
+        "  identity    "
+        + ("AudioMoth ✓" if status.mic_test_is_audiomoth
+           else "NOT an AudioMoth — this is a substitute input")
+    )
+    print(f"  captured    {status.mic_test_seconds:.1f}s at {status.mic_test_rate} Hz, "
+          f"{status.mic_test_channels} ch")
+    print(f"  level       {status.mic_test_rms_dbfs:.1f} dBFS rms, "
+          f"{status.mic_test_peak_dbfs:.1f} dBFS peak")
+    print(f"  dominant    {status.mic_test_dominant_hz:.0f} Hz")
+    for index, peak in enumerate(status.mic_test_peaks[:5], start=1):
+        bar = "█" * max(1, int((peak["db"] + 90) / 4))
+        print(f"    {index}. {peak['hz']:>8.0f} Hz  {peak['db']:>7.1f} dB  {bar}")
+    print(f"\n  {status.mic_test_message}")
+    return 0
+
+
 def cmd_config(cfg: Config) -> int:
     settings = _effective_settings(cfg, fetch=True)
     hours = "".join(str(h % 10) for h in range(24))
@@ -806,7 +1017,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="run",
         choices=[
             "run", "sample", "record", "analyse", "audio-test",
-            "scan", "upload", "config", "status", "refresh",
+            "scan", "upload", "config", "status", "refresh", "mic-test",
         ],
     )
     parser.add_argument("files", nargs="*", type=Path, help="analyse: WAV files to analyse")
@@ -827,6 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_analyse(cfg, args.files)
     if args.command == "refresh":
         return cmd_refresh(cfg)
+    if args.command == "mic-test":
+        return cmd_mic_test(cfg, seconds=args.seconds)
 
     handlers = {
         "run": cmd_run,

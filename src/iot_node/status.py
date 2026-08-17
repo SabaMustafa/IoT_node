@@ -33,6 +33,38 @@ STATUS_NAME = "status.json"
 # to, or being able to disturb the node in any other way.
 REFRESH_REQUEST_NAME = "refresh.request"
 
+# Same mechanism for "record a few seconds now and tell me what you heard".
+# The node owns the microphone — only one process can open it — so the test
+# has to be performed by the node, not by whatever asked for it.
+MIC_TEST_REQUEST_NAME = "mictest.request"
+
+
+def request_mic_test(state_dir: Path, seconds: float = 5.0) -> bool:
+    """Ask the node to record a short test clip and report on it."""
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / MIC_TEST_REQUEST_NAME).write_text(f"{seconds:g}")
+        return True
+    except OSError as exc:
+        log.warning("could not request a microphone test: %s", exc)
+        return False
+
+
+def take_mic_test_request(state_dir: Path) -> float | None:
+    """Consume a pending request, returning the requested duration."""
+    path = state_dir / MIC_TEST_REQUEST_NAME
+    try:
+        if not path.exists():
+            return None
+        raw = path.read_text().strip()
+        path.unlink()
+    except OSError:
+        return None
+    try:
+        return max(1.0, min(30.0, float(raw)))
+    except ValueError:
+        return 5.0
+
 
 def request_refresh(state_dir: Path) -> bool:
     """Ask the node to re-read config.ini on its next tick."""
@@ -94,6 +126,29 @@ class Status:
     recording_elapsed_s: float = 0.0
     recording_total_s: float = 0.0
     analysed_today: int = 0
+
+    # Live microphone test — proves which device is really being recorded from.
+    mic_test_state: str = ""  # "", "running", "ok", "failed"
+    mic_test_at: str = ""
+    mic_test_epoch: float = 0.0
+    mic_test_device: str = ""
+    mic_test_is_audiomoth: bool = False
+    mic_test_seconds: float = 0.0
+    mic_test_rate: int = 0
+    mic_test_channels: int = 0
+    mic_test_rms_dbfs: float | None = None
+    mic_test_peak_dbfs: float | None = None
+    mic_test_dominant_hz: float | None = None
+    mic_test_peaks: list[dict[str, float]] = field(default_factory=list)
+    mic_test_message: str = ""
+
+    # Live input level while a recording is in progress, so the screen shows
+    # the microphone working rather than only reporting once it has finished.
+    live_db: float | None = None
+    history_live_db: list[float] = field(default_factory=list)
+
+    def mic_test_age_s(self) -> float:
+        return time.time() - self.mic_test_epoch if self.mic_test_epoch else float("inf")
 
     # Schedule
     hour: int = 0

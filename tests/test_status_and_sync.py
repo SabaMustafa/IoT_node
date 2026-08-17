@@ -328,3 +328,20 @@ def test_the_default_is_still_seeded_on_a_genuinely_fresh_node(tmp_path):
 
     assert sync.refresh(force=True) is True
     assert "IoT/config.ini" in backend.files
+
+
+def test_live_level_history_accumulates(tmp_path):
+    """push_history builds 'history_<name>', so the field must match.
+
+    A mismatch here is silent: live_db updates fine and the meter stays empty.
+    """
+    writer = StatusWriter(tmp_path / "status.json", "n")
+    for db in (-40.0, -38.5, -42.0):
+        writer.update(live_db=db)
+        writer.push_history(live_db=db)
+    writer.publish()
+
+    status = read_status(tmp_path / "status.json")
+    assert status is not None
+    assert status.history_live_db == [-40.0, -38.5, -42.0]
+    assert status.live_db == -42.0

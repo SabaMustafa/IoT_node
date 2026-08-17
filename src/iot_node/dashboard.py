@@ -28,9 +28,15 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
-from .status import Status, read_status, request_refresh
+from .status import Status, read_status, request_mic_test, request_refresh
 
 REFRESH_MS = 2000
+
+# Long enough to hear something, short enough that nobody waits.
+MIC_TEST_SECONDS = 5.0
+
+# How long a finished test stays on screen before the panel reverts.
+MIC_TEST_VISIBLE_S = 90.0
 
 # Warm, high-contrast palette: readable across a shed at a glance, and easy on
 # the eyes as a screen that is on permanently.
@@ -68,6 +74,7 @@ class Dashboard:
         self._notice = ""
         self._notice_until = 0.0
         self._button: tuple[float, float, float, float] | None = None
+        self._mic_button: tuple[float, float, float, float] | None = None
 
         self.root.geometry("1280x720")
         if fullscreen:
@@ -78,6 +85,8 @@ class Dashboard:
         self.root.bind("<F11>", self._toggle_fullscreen)
         for sequence in ("<r>", "<R>"):
             self.root.bind(sequence, self._request_refresh)
+        for sequence in ("<t>", "<T>"):
+            self.root.bind(sequence, self._request_mic_test)
         # Closing via the window manager must take the same tidy path.
         self.root.protocol("WM_DELETE_WINDOW", self._on_quit)
 
@@ -107,6 +116,16 @@ class Dashboard:
         ok = request_refresh(self.status_path.parent)
         self._notice = (
             "config refresh requested…" if ok else "could not request a refresh"
+        )
+        self._notice_until = time.monotonic() + 8
+        self.tick_now()
+
+    def _request_mic_test(self, _event: Any = None) -> None:
+        """Ask the node to record a few seconds and report on the input."""
+        ok = request_mic_test(self.status_path.parent, MIC_TEST_SECONDS)
+        self._notice = (
+            f"microphone test requested ({MIC_TEST_SECONDS:g}s)…" if ok
+            else "could not request a microphone test"
         )
         self._notice_until = time.monotonic() + 8
         self.tick_now()
@@ -173,6 +192,79 @@ class Dashboard:
         if unit:
             self._text(right + 10, bottom - 20, unit, size=13, fill=MUTED)
 
+    def _mic_test_panel(self, x: int, y: int, w: int, h: int, status: Status) -> None:
+        """The result of a live microphone test.
+
+        Its job is to answer one question — "is it really recording from the
+        AudioMoth?" — so the device's identity is the headline, not the levels.
+        A working level from the wrong microphone is the failure this is meant
+        to catch.
+        """
+        state = status.mic_test_state
+        self._panel(x, y, w, h, "microphone test")
+
+        if state == "running":
+            self._text(x + 16, y + 38, "TESTING…", size=26, fill=AMBER, bold=True)
+            self._text(x + 16, y + 74, status.mic_test_message, size=12, fill=MUTED)
+            self._text(x + 16, y + 100, "LIVE INPUT", size=10, fill=MUTED, bold=True)
+            self._live_meter(x + 16, y + 118, w - 32, max(48.0, h - 118 - 30), status)
+            return
+
+        if state == "failed":
+            self._text(x + 16, y + 42, "FAILED", size=24, fill=BAD, bold=True)
+            for index, line in enumerate(_wrap(status.mic_test_message, 54)[:4]):
+                self._text(x + 16, y + 78 + index * 18, line, size=11, fill=INK)
+            return
+
+        # --- a successful test ---
+        good = status.mic_test_is_audiomoth
+        self._text(
+            x + 16, y + 36,
+            "✓ AudioMoth" if good else "⚠ NOT an AudioMoth",
+            size=22, fill=GOOD if good else WARN, bold=True,
+        )
+        self._text(x + 16, y + 68, status.mic_test_device[:56], size=11, fill=INK)
+        self._text(
+            x + 16, y + 88,
+            f"{status.mic_test_seconds:.1f}s · {status.mic_test_rate} Hz · "
+            f"{status.mic_test_channels} ch",
+            size=10, fill=MUTED,
+        )
+        if not good:
+            self._text(
+                x + 16, y + 108,
+                "this is a substitute input, not hive audio",
+                size=10, fill=WARN,
+            )
+
+        right = x + int(w * 0.46)
+        if status.mic_test_rms_dbfs is not None:
+            self._text(right, y + 36, f"{status.mic_test_rms_dbfs:.1f}",
+                       size=26, fill=INK, bold=True)
+            self._text(right, y + 70, "dBFS rms", size=10, fill=MUTED)
+            self._level_meter(
+                right, y + 90, w - (right - x) - 20, 14,
+                status.mic_test_rms_dbfs, status.mic_test_peak_dbfs,
+            )
+        if status.mic_test_dominant_hz:
+            self._text(right + 120, y + 36, f"{status.mic_test_dominant_hz:.0f}",
+                       size=26, fill=AMBER, bold=True)
+            self._text(right + 120, y + 70, "Hz dominant", size=10, fill=MUTED)
+
+        verdict = status.mic_test_message
+        colour = GOOD if verdict.startswith("microphone is working") else WARN
+        self._text(x + 16, y + h - 46, verdict[:70], size=12, fill=colour, bold=True)
+
+        peaks = status.mic_test_peaks[:4]
+        if peaks:
+            parts = "   ".join(f"{p['hz']:.0f}Hz {p['db']:.0f}dB" for p in peaks)
+            self._text(x + 16, y + h - 26, parts[:78], size=9, fill=MUTED, mono=True)
+        self._text(
+            x + w - 16, y + h - 26,
+            f"{status.mic_test_age_s():.0f}s ago · press t to repeat",
+            size=9, fill=MUTED, anchor="ne",
+        )
+
     def _acoustics(self, x: int, y: int, w: int, h: int, status: Status) -> None:
         """The hive's sound: where its energy sits, and how loud it is.
 
@@ -237,26 +329,70 @@ class Dashboard:
                 size=9, fill=WARN if bench else MUTED, anchor="ne",
             )
 
+    def _live_meter(self, x: float, y: float, w: float, h: float, status: Status) -> None:
+        """A per-second bar graph of the input while it is being recorded.
+
+        This is the thing that tells you at a glance that the microphone is
+        genuinely picking sound up: a flat line at the floor means silence
+        reaching a device that is otherwise working perfectly.
+        """
+        history = status.history_live_db[-60:]
+        floor, ceiling = -90.0, 0.0
+
+        self.canvas.create_rectangle(x, y, x + w, y + h, outline=LINE, fill=BG)
+        # Reference lines at -60/-30 dBFS to give the eye a scale.
+        for db in (-60.0, -30.0):
+            gy = y + h - (db - floor) / (ceiling - floor) * h
+            self.canvas.create_line(x, gy, x + w, gy, fill=LINE, dash=(2, 4))
+            self._text(x + 3, gy - 11, f"{db:.0f}", size=7, fill=MUTED)
+
+        if history:
+            slot = w / 60.0
+            for index, db in enumerate(history):
+                level = max(0.0, min(1.0, (db - floor) / (ceiling - floor)))
+                bar_h = max(1.0, level * (h - 2))
+                bx = x + (60 - len(history) + index) * slot
+                colour = GOOD if db < -18 else (WARN if db < -6 else BAD)
+                self.canvas.create_rectangle(
+                    bx + 1, y + h - bar_h, bx + slot - 1, y + h - 1,
+                    fill=colour, outline="",
+                )
+
+        if status.live_db is not None:
+            self._text(
+                x + w - 6, y + 4, f"{status.live_db:.1f} dBFS",
+                size=11, fill=INK, bold=True, anchor="ne",
+            )
+            if status.live_db < -70:
+                self._text(x + w - 6, y + 22, "SILENT", size=9, fill=BAD,
+                           bold=True, anchor="ne")
+        else:
+            self._text(x + w / 2, y + h / 2, "waiting for audio…",
+                       size=10, fill=MUTED, anchor="center")
+
     def _acoustics_waiting(self, x: int, y: int, w: int, h: int, status: Status) -> None:
         """Say what is happening instead of just 'nothing yet'."""
         if status.recording_now and status.recording_total_s:
             remaining = max(0.0, status.recording_total_s - status.recording_elapsed_s)
             done = status.recording_elapsed_s / status.recording_total_s
-            self._text(x + 16, y + 40, "RECORDING", size=26, fill=BAD, bold=True)
+            self._text(x + 16, y + 38, "RECORDING", size=26, fill=BAD, bold=True)
             self._text(
-                x + 16, y + 78,
+                x + 16, y + 74,
                 f"{int(remaining) // 60}:{int(remaining) % 60:02d} remaining "
                 f"of {int(status.recording_total_s) // 60} min  ·  analysis follows",
                 size=12, fill=MUTED,
             )
             bar_w = w - 32
             self.canvas.create_rectangle(
-                x + 16, y + 108, x + 16 + bar_w, y + 122, outline=LINE, fill=BG
+                x + 16, y + 96, x + 16 + bar_w, y + 108, outline=LINE, fill=BG
             )
             self.canvas.create_rectangle(
-                x + 16, y + 108, x + 16 + bar_w * min(1.0, done), y + 122,
+                x + 16, y + 96, x + 16 + bar_w * min(1.0, done), y + 108,
                 fill=BAD, outline="",
             )
+            # Live input, one bar per second.
+            self._text(x + 16, y + 120, "LIVE INPUT", size=10, fill=MUTED, bold=True)
+            self._live_meter(x + 16, y + 138, w - 32, max(48.0, h - 138 - 44), status)
         elif status.microphone_on_now:
             self._text(x + 16, y + 44, "waiting to record this hour",
                        size=15, fill=MUTED)
@@ -368,12 +504,27 @@ class Dashboard:
         # Remember where it is so clicks can be matched against it.
         self._button = (x, y, x + w, y + h)
 
+    def _mic_test_button(self, x: float, y: float) -> None:
+        """Record a few seconds now, to prove which microphone is really in use."""
+        w, h = 174.0, 30.0
+        self.canvas.create_rectangle(x, y, x + w, y + h, outline=AMBER, width=1, fill=PANEL)
+        self.canvas.create_text(
+            x + w / 2, y + h / 2, text="🎤  TEST MIC  (t)",
+            fill=AMBER, font=("DejaVu Sans", 10, "bold"),
+        )
+        self._mic_button = (x, y, x + w, y + h)
+
     def _on_click(self, event: Any) -> None:
-        if self._button is None:
-            return
-        x0, y0, x1, y1 = self._button
-        if x0 <= event.x <= x1 and y0 <= event.y <= y1:
-            self._request_refresh()
+        for box, action in (
+            (self._button, self._request_refresh),
+            (self._mic_button, self._request_mic_test),
+        ):
+            if box is None:
+                continue
+            x0, y0, x1, y1 = box
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                action()
+                return
 
     def _sparkline(
         self, x: int, y: int, w: int, h: int, values: list[float], colour: str
@@ -466,7 +617,10 @@ class Dashboard:
 
         # --- acoustics ---
         panel_w = int(column * 2 + margin)
-        self._acoustics(margin, lower_y, panel_w, lower_h, status)
+        if status.mic_test_state and status.mic_test_age_s() < MIC_TEST_VISIBLE_S:
+            self._mic_test_panel(margin, lower_y, panel_w, lower_h, status)
+        else:
+            self._acoustics(margin, lower_y, panel_w, lower_h, status)
 
         # --- schedule ---
         schedule_x = int(margin * 3 + column * 2)
@@ -489,6 +643,7 @@ class Dashboard:
             size=10, fill=MUTED,
         )
         self._refresh_button(schedule_x + schedule_w - 190, lower_y + lower_h - 52)
+        self._mic_test_button(schedule_x + schedule_w - 190, lower_y + lower_h - 90)
         if status.sensor_error:
             self._text(schedule_x + 16, lower_y + lower_h - 26,
                        status.sensor_error[:70], size=9, fill=BAD)
@@ -631,3 +786,18 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 #  Bee Node — developed by Mohammad (Amin) BarzegarTabrizi <mabiran@gmail.com>
 # ---------------------------------------------------------------------------
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Break a message into lines that fit, without a textwrap import."""
+    words, lines, current = text.split(), [], ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > width and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
