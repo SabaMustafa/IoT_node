@@ -1,0 +1,24 @@
+[Unit]
+Description=Bee Node dashboard (fullscreen status screen)
+Documentation=file:/home/saba/iot-node/docs/ARCHITECTURE.md
+# Graphical only: this is a user service and needs a session with a display.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/saba/iot-node
+ExecStart=/home/saba/iot-node/.venv/bin/iot-node-screen
+# The screen reads a JSON file and draws it. If it dies it takes nothing with
+# it, so just bring it back.
+Restart=always
+RestartSec=5
+# If the display is not up yet, retry rather than giving up permanently.
+StartLimitIntervalSec=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bee-node-screen
+
+[Install]
+WantedBy=graphical-session.target

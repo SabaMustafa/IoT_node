@@ -1,0 +1,106 @@
+# iot-node configuration.
+#
+# Values here are the tracked defaults. To override anything locally without
+# touching git, create config.local.yaml next to this file — it is deep-merged
+# on top of this one and is gitignored.
+#
+# ${ENV_VAR} references are expanded from the environment (and from a .env file
+# in the project root, if present). Never put secrets directly in this file.
+
+device:
+  id: pi5-node-01
+  site: ""
+  timezone: Pacific/Auckland
+
+paths:
+  # Relative paths resolve against the project root.
+  spool: var/spool # files staged for upload
+  state: var/state/iot-node.db # upload bookkeeping
+  logs: logs
+
+sensors:
+  enabled: true
+  i2c_bus: 1 # /dev/i2c-1 — the GPIO header bus (needs dtparam=i2c_arm=on)
+  sample_interval_s: 60 # how often to read the sensors
+  rollover: hourly # one readings file per hour: hourly | daily
+  bme280:
+    enabled: true
+    address: 0x76 # 0x77 if SDO is tied high
+  sgp40:
+    enabled: true
+    address: 0x59
+    # SGP40 raw signal is compensated with BME280 humidity/temperature when
+    # available; these are the fallbacks if the BME280 is missing.
+    default_humidity_pct: 50.0
+    default_temperature_c: 25.0
+
+audio:
+  enabled: true
+  # Directories scanned for finished recordings. A mounted AudioMoth SD card is
+  # picked up automatically as well when auto_detect is true.
+  source_dirs:
+    - /home/saba/Recordings
+  auto_detect: true
+  patterns: ["*.WAV", "*.wav"]
+  # A file is only ingested once its size has been stable for this long, so we
+  # never grab a recording that is still being written.
+  min_age_s: 30
+  min_size_bytes: 1024
+  # copy leaves the original in place; move frees the source card as it goes.
+  action: copy
+
+cloud:
+  # rclone   — uploads through a configured rclone remote. Sign in once with an
+  #            ordinary AUT account; no Azure app registration needed.
+  # onedrive — talks to the Microsoft Graph API directly (needs an app
+  #            registration in the tenant). See the onedrive: block below.
+  provider: rclone
+
+  rclone:
+    binary: rclone
+    remote: gdrive # the remote name given in `rclone config`
+    config_path: "" # blank = rclone's default (~/.config/rclone/rclone.conf)
+    # The shared root. config.ini and master_log.csv live here; each node gets
+    # its own <device_id>/<YYYY-MM-DD>/ folders underneath.
+    remote_root: "IoT"
+    retries: 3
+    timeout_s: 1800 # per file — a 30 MiB WAV on a slow uplink
+    bwlimit: "" # e.g. "2M" to leave headroom for other traffic
+    extra_args: []
+
+  onedrive:
+    # From the Azure app registration. tenant_id is the AUT tenant GUID (or the
+    # aut.ac.nz domain); "organizations" also works for device-code sign-in.
+    tenant_id: ${GRAPH_TENANT_ID}
+    client_id: ${GRAPH_CLIENT_ID}
+    # device_code: you sign in once interactively, the refresh token is cached.
+    # client_credentials: unattended, but needs tenant-admin consent and a secret.
+    auth_mode: device_code
+    client_secret: ${GRAPH_CLIENT_SECRET}
+    token_cache: secrets/token_cache.json
+    # Which drive to write to:
+    #   me    — the signed-in user's OneDrive (device_code only)
+    #   user  — a specific user's OneDrive, set user_principal_name
+    #   drive — an explicit drive_id
+    target: me
+    user_principal_name: ""
+    drive_id: ""
+    # {device_id} and strftime codes are expanded.
+    remote_root: "IoT/{device_id}"
+    conflict_behavior: replace # replace | rename | fail
+
+upload:
+  enabled: true
+  interval_s: 300
+  chunk_size_mib: 10 # must be a multiple of 320 KiB; 10 MiB is Graph's sweet spot
+  max_retries: 5
+  verify_size: true # re-check the remote size after upload
+  # Housekeeping for spooled files that uploaded successfully.
+  delete_after_upload: true
+  retention_days: 3 # kept this long if delete_after_upload is false
+  min_free_disk_pct: 10 # below this, uploaded files are purged early
+
+logging:
+  level: INFO
+  max_bytes: 5242880
+  backups: 5

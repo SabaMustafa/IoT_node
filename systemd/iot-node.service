@@ -1,0 +1,47 @@
+[Unit]
+Description=Bee Node: hive sensors, audio recording, frequency analysis, upload
+Documentation=file:/home/saba/iot-node/docs/ARCHITECTURE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# notify (not simple) so systemd knows when we are genuinely ready, and so the
+# watchdog below has a channel to be fed on.
+Type=notify
+NotifyAccess=main
+User=saba
+Group=saba
+# I2C access comes from the i2c group; removable cards from plugdev; the
+# AudioMoth capture device from audio.
+SupplementaryGroups=i2c plugdev audio
+WorkingDirectory=/home/saba/iot-node
+EnvironmentFile=-/home/saba/iot-node/.env
+ExecStart=/home/saba/iot-node/.venv/bin/iot-node run
+
+# --- staying alive ---------------------------------------------------------
+# If the process stops pinging for 90 s, systemd kills and restarts it. The
+# node pings every ~15 s while healthy, and deliberately stops pinging when a
+# task has stalled — so both a hard hang and a silent stall are recovered from.
+WatchdogSec=90
+Restart=always
+RestartSec=15
+# No start limit: a node in a field must keep trying however many times it
+# takes. A node that gives up after five restarts is a node that is offline.
+StartLimitIntervalSec=0
+# Give an in-flight upload or recording a chance to finish before SIGKILL.
+TimeoutStopSec=120
+KillSignal=SIGTERM
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/home/saba/iot-node
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=iot-node
+
+[Install]
+WantedBy=multi-user.target

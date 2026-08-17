@@ -1,0 +1,28 @@
+[Unit]
+Description=OneDrive mounted at ~/OneDrive (rclone)
+Documentation=file:/home/saba/iot-node/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# This drive's root holds ~30k items, so the first listing after a start takes
+# well over a minute. dir-cache-time is deliberately long and poll-interval
+# picks up remote changes, so that cost is paid once per restart, not hourly.
+ExecStartPre=/bin/mkdir -p %h/OneDrive
+ExecStart=/usr/bin/rclone mount saba_drive: %h/OneDrive \
+    --config=%h/.config/rclone/rclone.conf \
+    --vfs-cache-mode=full \
+    --vfs-cache-max-size=2G \
+    --vfs-cache-max-age=24h \
+    --dir-cache-time=72h \
+    --poll-interval=1m \
+    --umask=002 \
+    --log-level=INFO
+# Lazy unmount so a busy file manager cannot wedge shutdown.
+ExecStop=/bin/fusermount3 -uz %h/OneDrive
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

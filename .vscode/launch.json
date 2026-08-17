@@ -1,0 +1,50 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "iot-node: run (daemon)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "iot_node.main",
+      "args": ["run", "--verbose"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "iot-node: sample sensors once",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "iot_node.main",
+      "args": ["sample"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "iot-node: scan for recordings",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "iot_node.main",
+      "args": ["scan"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "iot-node: upload once",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "iot_node.main",
+      "args": ["upload", "--verbose"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "iot-node-auth: sign in to OneDrive",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "iot_node.cloud.auth_cli",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}

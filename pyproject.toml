@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iot-node"
+authors = [{ name = "Mohammad (Amin) BarzegarTabrizi", email = "mabiran@gmail.com" }]
+version = "0.2.0"
+description = "Bee Node: hive sensors, AudioMoth audio, frequency analysis, Google Drive upload"
+requires-python = ">=3.12"
+dependencies = [
+    # config + runtime
+    "PyYAML>=6.0",
+    "pydantic>=2.7",
+    # OneDrive / Microsoft Graph
+    "msal>=1.28",
+    "requests>=2.32",
+    # sensors (I2C)
+    "smbus2>=0.4.3",
+    # frequency analysis of hive recordings
+    "numpy>=1.26",
+    "sensirion-gas-index-algorithm>=3.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "types-PyYAML",
+    "types-requests",
+]
+
+[project.scripts]
+iot-node = "iot_node.main:main"
+iot-node-auth = "iot_node.cloud.auth_cli:main"
+iot-node-screen = "iot_node.dashboard:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["iot_node"]
+mypy_path = "src"
+ignore_missing_imports = true

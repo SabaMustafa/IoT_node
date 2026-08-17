@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import subprocess
+
+import pytest
+
+from iot_node.audio.recorder import (
+    CaptureDevice,
+    Recorder,
+    RecorderError,
+    find_audiomoth,
+    list_capture_devices,
+    probe_sample_rates,
+)
+
+ARECORD_L = """\
+**** List of CAPTURE Hardware Devices ****
+card 2: CAMERA [USB CAMERA], device 0: USB Audio [USB Audio]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 3: AudioMoth [AudioMoth USB Microphone], device 0: USB Audio [USB Audio]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+"""
+
+
+@pytest.fixture(autouse=True)
+def _arecord_on_path(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+
+def fake_run(monkeypatch, handler):
+    calls: list[list[str]] = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return handler(cmd)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def ok(stdout: str = "", stderr: str = ""):
+    return lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout, stderr)
+
+
+# --- device discovery --------------------------------------------------------
+
+
+def test_parses_arecord_listing(monkeypatch):
+    fake_run(monkeypatch, ok(ARECORD_L))
+    devices = list_capture_devices()
+
+    assert [d.name for d in devices] == ["USB CAMERA", "AudioMoth USB Microphone"]
+    assert devices[1].card == 3
+    assert devices[1].hw == "hw:3,0"
+
+
+def test_finds_the_audiomoth_among_others(monkeypatch):
+    fake_run(monkeypatch, ok(ARECORD_L))
+    device = find_audiomoth()
+
+    assert device is not None
+    assert device.card == 3
+
+
+def test_never_falls_back_to_another_microphone(monkeypatch):
+    """Recording the webcam mic and calling it bat data would be worse than nothing."""
+    listing = "card 2: CAMERA [USB CAMERA], device 0: USB Audio [USB Audio]\n"
+    fake_run(monkeypatch, ok(listing))
+
+    assert find_audiomoth() is None
+
+
+def test_no_devices_at_all(monkeypatch):
+    fake_run(monkeypatch, ok("**** List of CAPTURE Hardware Devices ****\n"))
+    assert list_capture_devices() == []
+
+
+def test_missing_arecord_is_reported(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    with pytest.raises(RecorderError, match="alsa-utils"):
+        list_capture_devices()
+
+
+def test_device_identification_is_case_insensitive():
+    assert CaptureDevice(1, 0, "audiomoth", "some usb thing").is_audiomoth
+    assert CaptureDevice(1, 0, "X", "AudioMoth USB Microphone").is_audiomoth
+    assert not CaptureDevice(1, 0, "CAMERA", "USB CAMERA").is_audiomoth
+
+
+# --- sample-rate probing -----------------------------------------------------
+
+
+def test_probe_reports_which_rates_work(monkeypatch):
+    device = CaptureDevice(3, 0, "AudioMoth", "AudioMoth USB Microphone")
+    supported = {"48000", "192000"}
+
+    def handler(cmd):
+        rate = cmd[cmd.index("-r") + 1]
+        if rate in supported:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 1, "", "Sample rate not available")
+
+    fake_run(monkeypatch, handler)
+    results = probe_sample_rates(device, rates=(8000, 48000, 192000))
+
+    assert results[48000] is None
+    assert results[192000] is None
+    assert "not available" in (results[8000] or "")
+
+
+def test_probe_uses_hw_not_plughw(monkeypatch):
+    """plughw would resample and report every rate as supported."""
+    device = CaptureDevice(3, 0, "AudioMoth", "AudioMoth USB Microphone")
+    calls = fake_run(monkeypatch, ok())
+
+    probe_sample_rates(device, rates=(48000,))
+
+    assert "hw:3,0" in calls[0]
+    assert not any("plughw" in str(arg) for arg in calls[0])
+
+
+# --- recording ---------------------------------------------------------------
+
+
+def test_unsupported_rate_falls_back_to_the_nearest_native(monkeypatch):
+    device = CaptureDevice(3, 0, "AudioMoth", "AudioMoth USB Microphone")
+    recorder = Recorder(output_dir=None, device=device)  # type: ignore[arg-type]
+
+    def handler(cmd):
+        rate = int(cmd[cmd.index("-r") + 1])
+        code = 0 if rate in (48000, 96000) else 1
+        return subprocess.CompletedProcess(cmd, code, "", "Sample rate not available")
+
+    fake_run(monkeypatch, handler)
+
+    # 192000 is unavailable; 96000 is the closest rate the hardware really has.
+    assert recorder.usable_rate(192000) == 96000
+    assert recorder.usable_rate(48000) == 48000
+
+
+def test_record_without_a_device_is_a_clear_error(monkeypatch, tmp_path):
+    fake_run(monkeypatch, ok("**** List of CAPTURE Hardware Devices ****\n"))
+    recorder = Recorder(tmp_path / "audio")
+
+    with pytest.raises(RecorderError, match="USB/OFF"):
+        recorder.record(sample_rate=48000, seconds=1)
+
+
+def test_partial_files_are_cleaned_up(tmp_path):
+    output = tmp_path / "audio"
+    output.mkdir()
+    stale = output / "20260814_120000.WAV.part"
+    stale.write_bytes(b"x" * 100)
+
+    Recorder(output).cleanup_partials()
+
+    assert not stale.exists()
+
+
+def test_recording_writes_a_part_file_then_renames(monkeypatch, tmp_path):
+    """A half-written recording must never be visible to the uploader."""
+    device = CaptureDevice(3, 0, "AudioMoth", "AudioMoth USB Microphone")
+    output = tmp_path / "audio"
+    recorder = Recorder(output, device=device)
+    recorder._supported = {48000: None}
+    recorder._good_rates = {48000}   # skip the probe; it would need real arecord
+    recorder._channels = 1
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, cmd, **kwargs):
+            # arecord writes to the .part path it was given.
+            target = tmp_path / cmd[-1]
+            assert str(target).endswith(".part")
+            target.write_bytes(b"RIFF" + b"\0" * 4096)
+
+        def communicate(self, timeout=None):
+            return b"", b""
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    path = recorder.record(sample_rate=48000, seconds=1)
+
+    assert path.suffix == ".WAV"
+    assert not path.name.endswith(".part")
+    assert list(output.glob("*.part")) == []
+
+
+def test_failed_arecord_leaves_nothing_behind(monkeypatch, tmp_path):
+    device = CaptureDevice(3, 0, "AudioMoth", "AudioMoth USB Microphone")
+    output = tmp_path / "audio"
+    recorder = Recorder(output, device=device)
+    recorder._supported = {48000: None}
+    recorder._good_rates = {48000}
+    recorder._channels = 1
+
+    class FailingPopen:
+        returncode = 1
+
+        def __init__(self, cmd, **kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            return b"", b"arecord: device busy"
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(subprocess, "Popen", FailingPopen)
+    with pytest.raises(RecorderError, match="device busy"):
+        recorder.record(sample_rate=48000, seconds=1)
+
+    assert list(output.glob("*")) == []

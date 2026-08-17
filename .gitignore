@@ -1,0 +1,33 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Secrets and local state — NEVER commit
+.env
+secrets/
+*.token
+token_cache.json
+state/
+*.db
+
+# Local data
+data/
+recordings/
+spool/
+logs/
+*.WAV
+*.wav
+
+# Local config override (config.yaml itself IS tracked)
+config.local.yaml
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime working directories
+var/
+secrets/
