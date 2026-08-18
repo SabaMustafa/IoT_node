@@ -1,19 +1,33 @@
 [Unit]
-Description=Bee Node dashboard (fullscreen status screen)
-Documentation=file:/home/saba/iot-node/docs/ARCHITECTURE.md
-# Graphical only: this is a user service and needs a session with a display.
-After=graphical-session.target
-PartOf=graphical-session.target
+Description=Bee Node dashboard (status screen)
+Documentation=file:/home/saba/iot-node/docs/OPERATING.md
+
+# Deliberately NOT tied to graphical-session.target. Raspberry Pi OS's labwc
+# session never activates that target — it is left inactive even with the
+# desktop fully up — so a unit wanting it silently never starts at boot.
+# default.target is reached by the user manager that lingering starts, which
+# does happen on every boot.
+After=default.target
 
 [Service]
 Type=simple
 WorkingDirectory=/home/saba/iot-node
+
+# A user service started at boot inherits none of the desktop's session
+# variables, so the display has to be named explicitly. Tk draws through
+# XWayland, hence DISPLAY; WAYLAND_DISPLAY is set too for anything that
+# prefers it.
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+
 ExecStart=/home/saba/iot-node/.venv/bin/iot-node-screen
-# The screen reads a JSON file and draws it. If it dies it takes nothing with
-# it, so just bring it back.
+
+# At boot this may well start before the desktop exists. The screen exits
+# non-zero when it cannot open a display, and systemd simply tries again — so
+# it appears by itself a few seconds after the desktop finishes loading,
+# rather than needing anyone to log in and start it.
 Restart=always
 RestartSec=5
-# If the display is not up yet, retry rather than giving up permanently.
 StartLimitIntervalSec=0
 
 StandardOutput=journal
@@ -21,4 +35,4 @@ StandardError=journal
 SyslogIdentifier=bee-node-screen
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
