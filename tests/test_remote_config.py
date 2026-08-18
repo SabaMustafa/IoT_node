@@ -75,7 +75,7 @@ def test_the_shipped_default_parses_cleanly():
     assert cfg.sensor_hours == [True] * HOURS
     # One hour of recording in every three, sampling the whole daily cycle.
     assert hours_on(cfg.microphone_hours) == [0, 3, 6, 9, 12, 15, 18, 21]
-    assert cfg.sample_rate == 48000
+    assert cfg.sample_rate == 16000
     assert cfg.recording_minutes == 5
     assert cfg.sensor_interval_s == 180
     assert cfg.upload_frequency == "6h"
@@ -104,7 +104,7 @@ frequency = 12h
     cfg = parse_config_ini(text)
 
     assert cfg.microphone_hours == [True] * HOURS
-    assert cfg.sample_rate == 48000  # the default, not the example's 384000
+    assert cfg.sample_rate == 16000  # the default, not the example's 384000
     assert cfg.upload_frequency == "daily"
 
 
@@ -179,7 +179,7 @@ recording_minutes = -3
 min_free_percent = 900
 """)
     assert cfg.sensor_hours == [True] * HOURS  # untouched default
-    assert cfg.sample_rate == 48000
+    assert cfg.sample_rate == 16000
     assert cfg.recording_minutes == 5
     assert cfg.min_free_percent == 15
     assert len(cfg.warnings) >= 3

@@ -114,7 +114,7 @@ def test_a_missing_remote_file_is_seeded_with_the_default(tmp_path):
 
     assert "IoT/config.ini" in backend.files
     assert "[schedule]" in backend.files["IoT/config.ini"]
-    assert sync.config.sample_rate == 48000
+    assert sync.config.sample_rate == 16000
 
 
 def test_refresh_respects_its_minimum_interval(tmp_path):
@@ -182,7 +182,7 @@ def test_with_nothing_cached_at_all_the_defaults_apply(tmp_path):
     sync, _ = make_sync(tmp_path)
     settings = sync.load_cached()
     assert sync.source == SOURCE_DEFAULT
-    assert settings.sample_rate == 48000
+    assert settings.sample_rate == 16000
 
 
 def test_master_log_upload_tracks_connectivity(tmp_path):

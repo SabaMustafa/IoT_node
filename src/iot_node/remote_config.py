@@ -27,11 +27,21 @@ log = logging.getLogger(__name__)
 
 HOURS = 24
 
-# What the AudioMoth USB Microphone firmware offers. Anything else is rejected
-# up front rather than failing obscurely inside arecord.
+# Rates config.ini will accept. Note what this is NOT: the AudioMoth USB
+# Microphone captures at 384000 Hz and nothing else, so every other value here
+# is one the recorder produces by reducing that natively-captured audio.
+#
+# 250000 is the odd one out — the AudioMoth family advertises it, but
+# 384000/250000 = 1.536, so it cannot be reached by whole-number reduction and
+# the recorder keeps the native rate instead. It is accepted rather than
+# rejected because rejecting it would silently substitute a rate the operator
+# did not choose; the recorder logs plainly what it is doing instead.
 SUPPORTED_SAMPLE_RATES = (8000, 16000, 32000, 48000, 96000, 192000, 250000, 384000)
 
-DEFAULT_SAMPLE_RATE = 48000
+# Matches the shipped config.ini. Only used when the key is missing or
+# unreadable, and a wrong guess there costs disk on every recording, so it
+# tracks the template rather than sitting at an older value.
+DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_RECORDING_MINUTES = 5.0
 DEFAULT_SENSOR_INTERVAL_S = 60.0
 DEFAULT_MIN_FREE_PERCENT = 15.0
@@ -398,8 +408,9 @@ DEFAULT_CONFIG_INI = """\
 ; ============================================================================
 ;  iot-node — field settings
 ;
-;  Edit this file right here in Google Drive. The node re-reads it about once
-;  an hour, so a change here reaches the device without anyone logging into it.
+;  Edit this file right here in Google Drive. The node re-reads it every 15
+;  minutes, so a change here reaches the device without anyone logging into it.
+;  Watch it arrive with:  journalctl -u iot-node -f
 ;
 ;  TIMETABLES: one value per hour of the day, 00:00 through 23:00, local time.
 ;      1 = do it during that hour        0 = skip that hour
@@ -421,11 +432,41 @@ microphone = 1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,0,0
 
 [audio]
 
-; Samples per second. The AudioMoth USB Microphone supports exactly these:
-;   8000, 16000, 32000, 48000, 96000, 192000, 250000, 384000
-; 48000 covers anything audible. Bats and insects need 192000 or higher, and
-; cost proportionally more disk: 384000 Hz fills a card 8x faster than 48000.
-sample_rate = 48000
+; Samples per second.
+;
+; The AudioMoth USB Microphone captures at ONE rate only: 384000 Hz. That is
+; fixed in its USB descriptor and no setting or switch position changes it —
+; DEFAULT/CUSTOM controls its standalone SD-card recording, not what it offers
+; over USB. Every other rate below is produced by the node, which captures at
+; 384000 and reduces it, filtering out everything above the new Nyquist first
+; so that ultrasound cannot fold down into the hive band.
+;
+; So the usable rates are 384000 divided by a WHOLE number:
+;
+;     rate     divisor   per 5-min file   per recording hour   Nyquist
+;     ------------------------------------------------------------------
+;      8000      48          4.6 MiB           54.9 MiB          4 kHz
+;     16000      24          9.2 MiB          109.9 MiB          8 kHz
+;     32000      12         18.3 MiB          219.7 MiB         16 kHz
+;     48000       8         27.5 MiB          329.6 MiB         24 kHz
+;     96000       4         54.9 MiB          659.2 MiB         48 kHz
+;    192000       2        109.9 MiB            1.29 GiB        96 kHz
+;    384000       1        219.7 MiB            2.58 GiB       192 kHz
+;
+; Multiply the hourly figure by the number of hours switched on in [schedule]
+; to get the daily cost, and check it against the free space on the drive.
+;
+; DO NOT USE 250000. The AudioMoth family advertises it, but 384000/250000 =
+; 1.536 is not a whole number, so the node cannot produce it and keeps the
+; native 384000 instead — you would ask for 250 kHz and get the largest files
+; possible. The journal says so, but nothing else will.
+;
+; Choosing: the analysis band further down is 20-2000 Hz, so anything above
+; 8000 Hz of Nyquist is recorded and uploaded but never examined unless
+; max_frequency is raised to match. 16000 leaves 4x headroom over that band;
+; 8000 still leaves 2x and halves the storage again. Use 96000 or above only
+; for ultrasound — bats, wingbeat harmonics.
+sample_rate = 16000
 
 ; Length of each audio file, in minutes. Shorter files upload more reliably
 ; over a poor link and lose less if one is interrupted.
@@ -445,8 +486,9 @@ input_device = auto
 
 ; How often to read temperature / humidity / pressure / air quality, in
 ; seconds, during an hour switched on above. 180 gives a reading every three
-; minutes and about 50 KB of CSV per day — small enough to ignore. Drop it to
-; 10 for fine-grained work, raise it to 600 to save power on batteries.
+; minutes, 480 readings and about 70 KB of CSV per day — small enough to
+; ignore beside the audio. Drop it to 10 for fine-grained work, raise it to
+; 600 to save power on batteries.
 sensor_interval_seconds = 180
 
 
@@ -454,8 +496,10 @@ sensor_interval_seconds = 180
 
 ; How often the day's data is pushed to Google Drive. Accepts 'daily',
 ; 'hourly', or any number of hours: '6h', '12h', '3h'.
-; Recordings are kept locally until they have been uploaded either way, so a
-; longer interval costs disk space, not data.
+; Recordings are kept locally until they have been uploaded, so a longer
+; interval costs disk space. It costs DATA too if the card then fills and
+; drop_oldest_when_full below is 'yes' — the two settings work together, so
+; read them as a pair.
 frequency = 6h
 
 
