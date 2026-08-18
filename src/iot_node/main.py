@@ -10,9 +10,9 @@
     iot-node status      # queue depth, disk, credentials, today's schedule
 
 What the node does each hour is decided by config.ini on the drive, not by
-anything on the Pi — see src/iot_node/remote_config.py. The run loop is
-single-threaded apart from recording, which blocks for its own duration in a
-worker so sampling and uploads continue underneath it.
+anything on the Pi — see src/iot_node/remote_config.py. The run loop keeps
+itself free: recording, uploading and config fetches each run in a worker, so
+none of them can stall the loop that answers the systemd watchdog.
 """
 
 from __future__ import annotations

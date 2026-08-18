@@ -23,6 +23,8 @@ AudioMoth ──▶ WAV ──┬───┘         │
 what talks to what, and why each piece is built the way it is. Start there to
 change anything.
 
+- [docs/MANUAL.md](docs/MANUAL.md) — the user manual: every command, starting and stopping, the terminal itself (also on the drive at
+  `IoT/releases/README.md`)
 - [docs/OPERATING.md](docs/OPERATING.md) — running it day to day
 - [docs/GOOGLE-DRIVE-SETUP.md](docs/GOOGLE-DRIVE-SETUP.md) — moving the node to a
   different Google account: creating the OAuth client ID and secret, and
@@ -43,7 +45,7 @@ the screen says **NODE SILENT** rather than showing stale numbers as current.
 `bee-node-screen.service`.
 
 ## Staying alive unattended
-Ok, I just replaced the cable. you do the s
+
 Three mechanisms, catching different failures:
 
 * **Crash** → `Restart=always`, no start limit.
@@ -74,8 +76,8 @@ piping around 300–600 Hz.
 
 Everything the node does hour to hour is decided by **`config.ini` in the `IoT`
 folder on Google Drive**, not by anything on the Pi. Edit it from a laptop or a
-phone; the node re-reads it hourly and applies the change without anyone logging
-in. If it is missing, the node writes a documented default for you to edit.
+phone; the node re-reads it every 15 minutes and applies the change without anyone
+logging in. If it is missing, the node writes a documented default for you to edit.
 
 ```ini
 [schedule]
@@ -84,14 +86,14 @@ sensors    = 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
 microphone = 0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0
 
 [audio]
-sample_rate = 48000          ; 8000 … 384000, see below
+sample_rate = 16000          ; must be 384000 / a whole number — see config.ini
 recording_minutes = 5
 
 [sensors]
 sensor_interval_seconds = 60 ; how often to read temp/humidity/pressure/VOC
 
 [upload]
-frequency = daily            ; daily | 12h
+frequency = 6h               ; daily | hourly | any number of hours: 6h, 12h
 
 [storage]
 delete_after_upload = yes
@@ -141,9 +143,9 @@ from a day with it deliberately off.
 
 ```bash
 scripts/setup-onedrive.sh      # install rclone, sign in, mount at boot
-.venv/bin/iot-node status      # queue depth, disk, I2C presence
-.venv/bin/iot-node sample      # read the sensors once
-.venv/bin/iot-node run         # the daemon
+iot-node status                # queue depth, disk, I2C presence
+iot-node sample                # read the sensors once
+iot-node run                   # the daemon (the service already runs this)
 ```
 
 | Command | What it does |
@@ -164,13 +166,16 @@ are genuinely different deployments:
 
 | You want | Firmware | Switch | How data arrives |
 | --- | --- | --- | --- |
-| The Pi to record on the timetable | **AudioMoth-USB-Microphone** | **USB/OFF** | Live capture over USB; the `microphone` timetable and `sample_rate` in config.ini control it |
+| The Pi to record on the timetable | **AudioMoth-USB-Microphone** | **DEFAULT** (or CUSTOM) | Live capture over USB; the `microphone` timetable and `sample_rate` in config.ini control it |
 | The AudioMoth to record standalone | AudioMoth-Firmware-Basic | CUSTOM or DEFAULT | It writes to its own microSD; the Pi ingests when the card is mounted |
 
-USB/OFF alone is not enough. With the **stock Basic firmware** that position
-only talks to the AudioMoth configuration app — it will not appear as a
-recording device at all. For the Pi to drive it you must flash the separate
-**USB Microphone** firmware first. Also make sure the cable is a data cable;
+**USB/OFF is the configuration position, not the recording one.** Whichever
+firmware is loaded, it presents a configuration interface to the AudioMoth app
+and does not appear as a capture device at all. With the **USB Microphone**
+firmware, DEFAULT or CUSTOM is what makes it a USB audio device the Pi can
+record from; with the stock **Basic** firmware those same positions make it
+record to its own microSD instead, and you must flash the separate USB
+Microphone firmware before the Pi can drive it live. Also make sure the cable is a data cable;
 charge-only USB cables are a common and confusing failure.
 
 Check what the Pi can actually see and record:
