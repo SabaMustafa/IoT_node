@@ -23,6 +23,11 @@ AudioMoth ──▶ WAV ──┬───┘         │
 what talks to what, and why each piece is built the way it is. Start there to
 change anything.
 
+- [docs/OPERATING.md](docs/OPERATING.md) — running it day to day
+- [docs/GOOGLE-DRIVE-SETUP.md](docs/GOOGLE-DRIVE-SETUP.md) — moving the node to a
+  different Google account: creating the OAuth client ID and secret, and
+  swapping rclone's credentials over
+
 ## The screen
 
 ```bash
@@ -38,7 +43,7 @@ the screen says **NODE SILENT** rather than showing stale numbers as current.
 `bee-node-screen.service`.
 
 ## Staying alive unattended
-
+Ok, I just replaced the cable. you do the s
 Three mechanisms, catching different failures:
 
 * **Crash** → `Restart=always`, no start limit.
