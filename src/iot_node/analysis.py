@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import wave
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,9 +47,12 @@ FFT_SIZE = 4096
 # through the window's skirts, so only the taller one is reported.
 MIN_PEAK_SEPARATION_HZ = 15.0
 
-# Cap on how much audio is read into memory at once. A 5-minute 384 kHz file is
-# ~230 MB as float64; on a Pi that is worth avoiding.
-MAX_SAMPLES = 8_000_000
+# How much audio to pull from the file at a time. The recording is analysed in
+# full regardless of its length: reading it in blocks keeps memory flat, so
+# coverage is never quietly decided by what happens to fit. Capping the read
+# instead used to leave the last 2.2 minutes of every five-minute recording
+# unanalysed while the CSV reported the truncated span as the duration.
+READ_BLOCK_FRAMES = 1 << 18
 
 
 class AnalysisError(RuntimeError):
@@ -122,21 +126,8 @@ def analysis_columns(top_peaks: int) -> list[str]:
     return columns
 
 
-def _read_wav(path: Path) -> tuple[np.ndarray, int]:
-    """Read a WAV as mono float in [-1, 1], plus its sample rate."""
-    try:
-        with wave.open(str(path), "rb") as handle:
-            channels = handle.getnchannels()
-            width = handle.getsampwidth()
-            rate = handle.getframerate()
-            frames = handle.getnframes()
-            if rate <= 0 or frames <= 0:
-                raise AnalysisError(f"{path.name}: empty or malformed WAV")
-            frames = min(frames, MAX_SAMPLES // max(1, channels))
-            raw = handle.readframes(frames)
-    except (OSError, EOFError, wave.Error) as exc:
-        raise AnalysisError(f"{path.name}: cannot read WAV ({exc})") from exc
-
+def _decode_frames(raw: bytes, *, width: int, channels: int, name: str) -> np.ndarray:
+    """One block of raw WAV bytes as mono float32 in [-1, 1]."""
     if width == 1:
         # 8-bit WAV is unsigned, centred on 128.
         data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
@@ -153,12 +144,61 @@ def _read_wav(path: Path) -> tuple[np.ndarray, int]:
     elif width == 4:
         data = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
     else:
-        raise AnalysisError(f"{path.name}: unsupported sample width {width * 8}-bit")
+        raise AnalysisError(f"{name}: unsupported sample width {width * 8}-bit")
 
     if channels > 1:
         usable = (len(data) // channels) * channels
         data = data[:usable].reshape(-1, channels).mean(axis=1)
-    return data, rate
+    return data
+
+
+def _stream_wav(
+    path: Path, block_frames: int = READ_BLOCK_FRAMES
+) -> tuple[int, int, Iterator[np.ndarray]]:
+    """Sample rate, frame count, and the audio as successive mono blocks.
+
+    Streamed rather than loaded whole, so a recording of any length or rate is
+    analysed in full on a device with modest memory.
+    """
+    try:
+        handle = wave.open(str(path), "rb")
+    except (OSError, EOFError, wave.Error) as exc:
+        raise AnalysisError(f"{path.name}: cannot read WAV ({exc})") from exc
+
+    try:
+        channels = handle.getnchannels()
+        width = handle.getsampwidth()
+        rate = handle.getframerate()
+        frames = handle.getnframes()
+    except wave.Error as exc:
+        handle.close()
+        raise AnalysisError(f"{path.name}: cannot read WAV ({exc})") from exc
+
+    if rate <= 0 or frames <= 0:
+        handle.close()
+        raise AnalysisError(f"{path.name}: empty or malformed WAV")
+
+    def blocks() -> Iterator[np.ndarray]:
+        try:
+            while True:
+                try:
+                    raw = handle.readframes(block_frames)
+                except (OSError, EOFError, wave.Error) as exc:
+                    raise AnalysisError(f"{path.name}: cannot read WAV ({exc})") from exc
+                if not raw:
+                    return
+                yield _decode_frames(raw, width=width, channels=channels, name=path.name)
+        finally:
+            handle.close()
+
+    return rate, frames, blocks()
+
+
+def _read_wav(path: Path) -> tuple[np.ndarray, int]:
+    """The whole recording as mono float in [-1, 1], plus its sample rate."""
+    rate, _, blocks = _stream_wav(path)
+    chunks = [block for block in blocks if block.size]
+    return (np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)), rate
 
 
 def _to_db(amplitude: float | np.ndarray) -> Any:
@@ -230,37 +270,59 @@ def analyse_wav(
     device: str = "",
 ) -> AnalysisResult:
     """Analyse one recording. Raises AnalysisError if it cannot be read."""
-    samples, rate = _read_wav(path)
-    if samples.size == 0:
+    rate, total_frames, blocks = _stream_wav(path)
+    if total_frames == 0:
         raise AnalysisError(f"{path.name}: no audio samples")
 
-    duration = samples.size / rate
-    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
-    peak_amplitude = float(np.max(np.abs(samples)))
-    rms_dbfs = float(_to_db(rms))
+    # The whole recording, not the part that happened to fit in memory.
+    duration = total_frames / rate
 
     # Welch-style average: split into overlapping windows and mean the spectra.
     # A single FFT over five minutes would smear transients into the noise;
     # averaging gives a stable picture of the colony's steady hum.
-    window_size = min(FFT_SIZE, samples.size)
+    window_size = min(FFT_SIZE, total_frames)
     if window_size < 16:
-        raise AnalysisError(f"{path.name}: too short to analyse ({samples.size} samples)")
+        raise AnalysisError(f"{path.name}: too short to analyse ({total_frames} samples)")
     window = np.hanning(window_size)
     # Normalise so window loss does not bias the reported amplitudes.
     window_gain = float(np.sum(window)) / 2.0
 
     step = max(1, window_size // 2)
-    starts = range(0, max(1, samples.size - window_size + 1), step)
     accumulator = np.zeros(window_size // 2 + 1, dtype=np.float64)
     count = 0
-    for start in starts:
-        chunk = samples[start : start + window_size]
-        if chunk.size < window_size:
-            break
-        accumulator += np.abs(np.fft.rfft(chunk * window))
-        count += 1
+
+    # Level statistics accumulate over every sample; the spectrum consumes the
+    # same stream in overlapping windows, with whatever spans a block boundary
+    # carried over so no window is skipped and none is counted twice.
+    sum_of_squares = 0.0
+    sample_count = 0
+    peak_amplitude = 0.0
+    carry = np.zeros(0, dtype=np.float32)
+
+    for block in blocks:
+        if block.size == 0:
+            continue
+        wide = block.astype(np.float64)
+        sum_of_squares += float(np.dot(wide, wide))
+        sample_count += block.size
+        peak_amplitude = max(peak_amplitude, float(np.abs(block).max()))
+
+        carry = block if carry.size == 0 else np.concatenate([carry, block])
+        offset = 0
+        while carry.size - offset >= window_size:
+            chunk = carry[offset : offset + window_size]
+            accumulator += np.abs(np.fft.rfft(chunk * window))
+            count += 1
+            offset += step
+        carry = carry[offset:]
+
     if count == 0:
         raise AnalysisError(f"{path.name}: not enough audio for one analysis window")
+    if sample_count == 0:
+        raise AnalysisError(f"{path.name}: no audio samples")
+
+    rms = math.sqrt(sum_of_squares / sample_count)
+    rms_dbfs = float(_to_db(rms))
 
     spectrum = accumulator / (count * window_gain)
     freqs = np.fft.rfftfreq(window_size, d=1.0 / rate)
