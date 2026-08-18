@@ -97,6 +97,11 @@ class Node:
         self._sync: ConfigSync | None = None
         self._stop = threading.Event()
         self._recording = threading.Event()
+        self._uploading = threading.Event()
+        self._syncing = threading.Event()
+        # Settings fetched by the sync thread, waiting to be applied by the
+        # main loop.
+        self._pending_settings: RemoteConfig | None = None
         self._last_upload = 0.0
         self._analysed: list[float] = []
         self._recording_started = 0.0
@@ -148,13 +153,47 @@ class Node:
     # --- tasks ---------------------------------------------------------------
 
     def task_config(self) -> None:
+        """Adopt any fetched config, and start the next fetch in the background.
+
+        Fetching talks to the network, and rclone is allowed up to half an hour
+        for a transfer — long enough to stop the watchdog heartbeat and have the
+        node killed for a slow link it was handling perfectly well. Only the
+        fetch moves off the main loop: the settings themselves are applied here,
+        so the writers they reconfigure are still only ever touched by one
+        thread.
+        """
         sync = self.sync
         if sync is None:
             return
-        if sync.refresh(min_interval_s=CONFIG_REFRESH_S - 60):
-            self._apply_settings(sync.config)
+
+        pending = self._pending_settings
+        if pending is not None:
+            self._pending_settings = None
+            self._apply_settings(pending)
             self.status.update(config_fetched_utc=_utc_now())
-        sync.push_master_log(self.master.path)
+
+        if self._syncing.is_set():
+            return
+        self._syncing.set()
+        threading.Thread(
+            target=self._sync_config_once, name="config-sync", daemon=True
+        ).start()
+
+    def _sync_config_once(self) -> None:
+        """Fetch config.ini and push the master log. Runs off the main loop."""
+        sync = self.sync
+        if sync is None:  # pragma: no cover - guarded by the caller
+            self._syncing.clear()
+            return
+        try:
+            if sync.refresh(min_interval_s=CONFIG_REFRESH_S - 60):
+                self._pending_settings = sync.config
+            sync.push_master_log(self.master.path)
+        except Exception:
+            # Losing a config refresh is survivable — the cached copy stands.
+            log.exception("config sync failed")
+        finally:
+            self._syncing.clear()
 
     def _apply_settings(self, settings: RemoteConfig) -> None:
         """Adopt a new config.ini across every component that cares."""
@@ -459,30 +498,55 @@ class Node:
         )
 
     def task_upload(self) -> None:
+        """Start an upload pass in the background if one is due.
+
+        Uploading is network-bound and effectively unbounded: rclone is allowed
+        300s for a single file, and a pass works through the whole backlog. Run
+        on the main loop that stops the watchdog heartbeat, and systemd kills
+        the node mid-transfer — which is exactly what happened 21 times in one
+        night. The loop must stay free to answer, so the pass gets its own
+        thread, as recording does.
+        """
         uploader = self.uploader
-        if uploader is None:
+        if uploader is None or self._uploading.is_set():
             return
         now = time.monotonic()
         if self._last_upload and (now - self._last_upload) < self.settings.upload_interval_s:
             return
         self._last_upload = now
 
-        # Anything more frequent than daily wants the day so far, not only
-        # finished days, or a 6-hourly cadence would still ship nothing until
-        # midnight.
-        if self.settings.upload_interval_hours < 24:
-            self.sensors.writer.publish_today()
-            self.analysis.publish_today()
+        self._uploading.set()
+        threading.Thread(target=self._upload_once, name="uploader", daemon=True).start()
 
-        uploaded, failed = uploader.run_once()
-        if uploaded or failed:
-            log.info("upload pass: %d ok, %d failed", uploaded, failed)
-            self.master.update(self.today, uploaded_files=f"+{uploaded}")
-        sync = self.sync
-        if sync is not None:
-            sync.push_master_log(self.master.path)
-            self.status.update(online=sync.online, config_source=sync.source)
-        self.status.update(last_upload_utc=_utc_now())
+    def _upload_once(self) -> None:
+        """One upload pass. Runs off the main loop; must never raise into it."""
+        uploader = self.uploader
+        if uploader is None:  # pragma: no cover - guarded by the caller
+            self._uploading.clear()
+            return
+        try:
+            # Anything more frequent than daily wants the day so far, not only
+            # finished days, or a 6-hourly cadence would still ship nothing
+            # until midnight.
+            if self.settings.upload_interval_hours < 24:
+                self.sensors.writer.publish_today()
+                self.analysis.publish_today()
+
+            uploaded, failed = uploader.run_once()
+            if uploaded or failed:
+                log.info("upload pass: %d ok, %d failed", uploaded, failed)
+                self.master.update(self.today, uploaded_files=f"+{uploaded}")
+            sync = self.sync
+            if sync is not None:
+                sync.push_master_log(self.master.path)
+                self.status.update(online=sync.online, config_source=sync.source)
+            self.status.update(last_upload_utc=_utc_now())
+        except Exception:
+            # A failed pass is a logged event, not a reason to lose the node;
+            # the next pass retries whatever is still queued.
+            log.exception("upload pass failed")
+        finally:
+            self._uploading.clear()
 
     def task_status(self) -> None:
         """Publish the snapshot the dashboard renders, and pet the watchdog."""
