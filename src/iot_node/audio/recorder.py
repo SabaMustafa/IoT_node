@@ -4,8 +4,20 @@ Deliberately captures through ``hw:`` rather than ``plughw:``. plughw would
 silently resample whatever the device actually supports up or down to the rate
 we asked for, which is fine for voice and wrong for bioacoustics — a 192 kHz
 file resampled from a 48 kHz capture looks ultrasonic and contains nothing above
-24 kHz. If a requested rate is not natively supported we say so and fall back to
-the nearest rate the hardware genuinely offers.
+24 kHz.
+
+Capturing through ``hw:`` does not by itself get us the rate we asked for.
+arecord opens the device at its own nearest rate, prints ``Warning: rate is not
+accurate (requested = 48000Hz, got = 384000Hz)``, exits 0, and writes a file
+whose header says 384000. Trusting the exit code therefore yields files eight
+times the intended size while every log line claims the configured rate. So we
+read back what ALSA actually opened, and when the hardware cannot give us the
+configured rate we capture at its native rate and reduce it ourselves as it
+arrives (see ``resample``), so the oversized audio never touches the card.
+
+Downsampling is not the thing plughw was rejected for. Discarding bandwidth we
+genuinely captured is honest and anti-alias filtered; inventing bandwidth we
+never captured is not.
 """
 
 from __future__ import annotations
@@ -16,11 +28,15 @@ import re
 import shutil
 import subprocess
 import time
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 from ..remote_config import SUPPORTED_SAMPLE_RATES
+from .resample import Decimator
 
 log = logging.getLogger(__name__)
 
@@ -220,10 +236,37 @@ def select_device(preference: str = "auto", arecord: str = "arecord") -> Capture
     )
 
 
-def _try_capture(
+# Whatever we ask for, arecord reports what it actually opened:
+#   Recording raw data '/dev/null' : Signed 16 bit Little Endian, Rate 384000 Hz
+# and, when that is not what we asked for, says so first:
+#   Warning: rate is not accurate (requested = 48000Hz, got = 384000Hz)
+_RATE_SUBSTITUTED = re.compile(r"got\s*=\s*(\d+)\s*Hz")
+_RATE_OPENED = re.compile(r"Rate (\d+) Hz")
+
+# A device someone else already has open fails identically to one that cannot
+# do the rate. Recording "busy" as "unsupported" would blacklist a perfectly
+# good rate for the life of the process — which is exactly how a live recording
+# taught this node that its microphone could not do 48 kHz.
+_BUSY_MARKERS = ("resource busy", "device busy")
+
+
+@dataclass(frozen=True)
+class CaptureProbe:
+    """What one trial capture revealed about the hardware."""
+
+    error: str | None = None
+    delivered_rate: int | None = None
+    busy: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def _capture_probe(
     binary: str, device: CaptureDevice, *, fmt: str, channels: int, rate: int, seconds: float
-) -> str | None:
-    """One short trial capture. Returns None on success, else the error line."""
+) -> CaptureProbe:
+    """One short trial capture, reporting the rate the hardware really gave."""
     try:
         proc = subprocess.run(
             [
@@ -234,11 +277,30 @@ def _try_capture(
             capture_output=True, text=True, timeout=20, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return str(exc)
+        return CaptureProbe(str(exc))
+
+    stderr = proc.stderr or ""
+    found = _RATE_SUBSTITUTED.search(stderr) or _RATE_OPENED.search(stderr)
+    delivered = int(found.group(1)) if found else None
+
     if proc.returncode == 0:
-        return None
-    lines = (proc.stderr or "").strip().splitlines()
-    return lines[-1] if lines else f"exit code {proc.returncode}"
+        return CaptureProbe(delivered_rate=delivered)
+    lines = stderr.strip().splitlines()
+    lowered = stderr.lower()
+    return CaptureProbe(
+        error=lines[-1] if lines else f"exit code {proc.returncode}",
+        delivered_rate=delivered,
+        busy=any(marker in lowered for marker in _BUSY_MARKERS),
+    )
+
+
+def _try_capture(
+    binary: str, device: CaptureDevice, *, fmt: str, channels: int, rate: int, seconds: float
+) -> str | None:
+    """One short trial capture. Returns None on success, else the error line."""
+    return _capture_probe(
+        binary, device, fmt=fmt, channels=channels, rate=rate, seconds=seconds
+    ).error
 
 
 def probe_channels(
@@ -275,18 +337,43 @@ def probe_sample_rates(
 
     results: dict[int, str | None] = {}
     for rate in rates:
-        error: str | None = "no supported sample format"
-        for count in candidates:
-            for fmt in _FORMATS:
-                error = _try_capture(
-                    binary, device, fmt=fmt, channels=count, rate=rate, seconds=seconds
-                )
-                if error is None:
-                    break
-            if error is None:
-                break
-        results[rate] = error
+        results[rate] = _probe_one_rate(
+            binary, device, rate=rate, candidates=candidates, seconds=seconds
+        )
     return results
+
+
+def _probe_one_rate(
+    binary: str,
+    device: CaptureDevice,
+    *,
+    rate: int,
+    candidates: tuple[int, ...],
+    seconds: float,
+) -> str | None:
+    """Is this rate genuinely native? None if so, else why not.
+
+    Exit status alone cannot answer this. arecord returns 0 for every rate this
+    AudioMoth was asked for, having quietly opened the device at 384 kHz each
+    time — so judging by exit code declares all eight rates supported, and the
+    caller then believes the one it asked for is fine. That is how five-minute
+    recordings came back eight times their intended size while the log claimed
+    the configured rate.
+    """
+    error: str | None = "no supported sample format"
+    for count in candidates:
+        for fmt in _FORMATS:
+            probe = _capture_probe(
+                binary, device, fmt=fmt, channels=count, rate=rate, seconds=seconds
+            )
+            if probe.ok and probe.delivered_rate not in (None, rate):
+                # Accepted, but not honoured. No format or channel count
+                # changes that, so stop asking.
+                return f"device delivers {probe.delivered_rate} Hz, not {rate} Hz"
+            error = probe.error
+            if error is None:
+                return None
+    return error
 
 
 class Recorder:
@@ -377,15 +464,33 @@ class Recorder:
             binary = shutil.which(self.arecord)
             if binary is None:
                 return requested
-            error = _try_capture(
+            probe = _capture_probe(
                 binary, device, fmt="S16_LE",
                 channels=self.usable_channels(), rate=requested, seconds=0.4,
             )
-            if error is None:
+            if probe.busy:
+                # Nothing was learned about the rate, only that something else
+                # holds the device. Answering once is fine; caching it would
+                # condemn a good rate for the life of the process.
+                log.debug("%s is busy — leaving %d Hz unjudged", device.name, requested)
+                return requested
+            delivered = probe.delivered_rate
+            if probe.ok and delivered in (None, requested):
                 self._good_rates.add(requested)
                 return requested
+            if probe.ok and delivered:
+                # arecord exited 0 having quietly opened the device at its own
+                # rate. Report what we will really get, so the caller downsamples
+                # deliberately instead of mislabelling an oversized file.
+                self._bad_rates.add(requested)
+                self._good_rates.add(delivered)
+                log.info(
+                    "%s captures only at %d Hz, not the requested %d Hz",
+                    device.name, delivered, requested,
+                )
+                return delivered
             self._bad_rates.add(requested)
-            log.warning("%d Hz refused by %s: %s", requested, device.name, error)
+            log.warning("%d Hz refused by %s: %s", requested, device.name, probe.error)
 
         # The configured rate genuinely does not work, so find the nearest that
         # does rather than silently resampling.
@@ -404,10 +509,13 @@ class Recorder:
         if not working:
             return requested
         nearest = min(working, key=lambda r: abs(r - requested))
-        log.warning(
-            "%d Hz is not supported natively by %s — recording at %d Hz instead "
-            "(resampling would fake bandwidth that was never captured)",
-            requested, device.name, nearest,
+        # Not a warning: capturing at the rate the hardware actually offers is
+        # the correct thing to do, and the caller reduces it to the configured
+        # rate afterwards. What would deserve a warning is pretending the
+        # device gave us a rate it never did.
+        log.info(
+            "%s cannot capture %d Hz natively — capturing its %d Hz instead",
+            device.name, requested, nearest,
         )
         return nearest
 
@@ -421,8 +529,27 @@ class Recorder:
         if not binary:
             raise RecorderError("arecord not found — install alsa-utils")
 
-        rate = self.usable_rate(sample_rate)
-        channels = channels if channels is not None else self.usable_channels(rate)
+        native = self.usable_rate(sample_rate)
+        channels = channels if channels is not None else self.usable_channels(native)
+
+        # Some hardware offers exactly one rate — the AudioMoth USB Microphone
+        # is fixed at 384 kHz in its USB descriptor, whatever the mode switch is
+        # set to. Writing that rate when 48 kHz was configured costs eight times
+        # the card space, so capture natively and reduce it as it arrives; the
+        # full-rate audio is never written down.
+        factor = 0
+        if native != sample_rate:
+            if sample_rate > 0 and native > sample_rate and native % sample_rate == 0:
+                factor = native // sample_rate
+            else:
+                log.warning(
+                    "%s captures at %d Hz, which is not a whole multiple of the "
+                    "configured %d Hz — keeping the native rate rather than "
+                    "resampling by an awkward ratio",
+                    device.name, native, sample_rate,
+                )
+        rate = sample_rate if factor >= 2 else native
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         started = datetime.now()
         # Same naming the AudioMoth itself uses, so both sources sort together
@@ -430,18 +557,38 @@ class Recorder:
         final = self.output_dir / f"{started:%Y%m%d_%H%M%S}.WAV"
         partial = final.with_suffix(".WAV.part")
 
-        cmd = [
+        # A reduced capture arrives as a raw stream we frame ourselves; an
+        # unreduced one lets arecord write the container as before.
+        capture = [
             binary, "-D", device.hw, "-f", "S16_LE", "-c", str(channels),
-            "-r", str(rate), "-d", str(int(seconds)), "-t", "wav", str(partial),
+            "-r", str(native), "-d", str(int(seconds)),
+            *(("-t", "raw", "-") if factor >= 2 else ("-t", "wav", str(partial))),
         ]
-        log.info(
-            "recording %.0fs at %d Hz, %d ch, from %s", seconds, rate, channels, device.name
-        )
+
+        if factor >= 2:
+            log.info(
+                "recording %.0fs from %s at %d Hz, %d ch, reduced %d:1 to %d Hz",
+                seconds, device.name, native, channels, factor, rate,
+            )
+        else:
+            log.info(
+                "recording %.0fs at %d Hz, %d ch, from %s",
+                seconds, rate, channels, device.name,
+            )
+
         self.active_partial, self.active_rate, self.active_channels = partial, rate, channels
         try:
-            self._process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            _, stderr = self._process.communicate(timeout=seconds + 60)
-            returncode = self._process.returncode
+            if factor >= 2:
+                stderr, returncode = self._record_reduced(
+                    capture, partial, factor=factor, channels=channels,
+                    out_rate=rate, timeout=seconds + 60,
+                )
+            else:
+                self._process = subprocess.Popen(
+                    capture, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+                _, stderr = self._process.communicate(timeout=seconds + 60)
+                returncode = self._process.returncode
         except subprocess.TimeoutExpired:
             self.stop()
             raise RecorderError(f"arecord overran its {seconds:.0f}s recording") from None
@@ -463,6 +610,75 @@ class Recorder:
         os.replace(partial, final)
         log.info("recorded %s (%.1f MiB)", final.name, final.stat().st_size / 1048576)
         return final
+
+    def _record_reduced(
+        self,
+        capture: list[str],
+        partial: Path,
+        *,
+        factor: int,
+        channels: int,
+        out_rate: int,
+        timeout: float,
+    ) -> tuple[bytes, int]:
+        """Capture natively and write the reduced file as the audio arrives.
+
+        Nothing larger than one buffer is ever held, so a five-minute 384 kHz
+        recording costs a few hundred kilobytes of memory and writes only the
+        48 kHz file the configuration asked for.
+        """
+        decimators = [Decimator(factor) for _ in range(channels)]
+        frame = 2 * channels  # 16-bit samples, interleaved
+        deadline = time.monotonic() + timeout
+        leftover = b""
+
+        self._process = subprocess.Popen(
+            capture, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        stream = self._process.stdout
+        if stream is None:  # pragma: no cover - Popen always gives us the pipe
+            raise RecorderError("could not read from arecord")
+
+        with wave.open(str(partial), "wb") as out:
+            out.setnchannels(channels)
+            out.setsampwidth(2)
+            out.setframerate(out_rate)
+            while True:
+                if time.monotonic() > deadline:
+                    self.stop()
+                    raise subprocess.TimeoutExpired(capture[0], timeout)
+                block = stream.read(262144)
+                if not block:
+                    break
+                block = leftover + block
+                # A read can split an interleaved frame; carry the remainder.
+                usable = len(block) - len(block) % frame
+                leftover = block[usable:]
+                if not usable:
+                    continue
+                samples = np.frombuffer(block[:usable], dtype="<i2")
+                out.writeframes(
+                    self._interleave(
+                        [d.process(samples[i::channels]) for i, d in enumerate(decimators)]
+                    )
+                )
+            out.writeframes(self._interleave([d.flush() for d in decimators]))
+
+        self._process.wait(timeout=30)
+        stderr = self._process.stderr.read() if self._process.stderr else b""
+        return stderr or b"", self._process.returncode
+
+    @staticmethod
+    def _interleave(planes: list[np.ndarray]) -> bytes:
+        """Weave per-channel samples back into one interleaved block."""
+        if len(planes) == 1:
+            return planes[0].tobytes()
+        # Channels can differ by a sample at a chunk boundary; the shortest
+        # decides, and the rest is carried by the decimators themselves.
+        width = min(plane.size for plane in planes)
+        if not width:
+            return b""
+        return np.column_stack([plane[:width] for plane in planes]).ravel().tobytes()
 
     def stop(self) -> None:
         """Interrupt a recording in progress (used on shutdown)."""
