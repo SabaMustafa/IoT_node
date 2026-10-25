@@ -6,6 +6,7 @@
     iot-node audio-test  # probe the AudioMoth at every supported sample rate
     iot-node scan        # stage any recordings found on a card, then stop
     iot-node upload      # drain the spool once, then stop
+    iot-node forward     # send what is queued for the Flask server once, then stop
     iot-node config      # show the effective config.ini, fetching if possible
     iot-node status      # queue depth, disk, credentials, today's schedule
 
@@ -41,6 +42,7 @@ from .audio.recorder import (
 )
 from .cloud.backend import UploadError
 from .cloud.config_sync import ConfigSync
+from .cloud.flask_forward import FlaskForwarder
 from .cloud.uploader import Uploader
 from .config import Config, load_config
 from .csv_log import AnalysisCsvWriter, MasterLog
@@ -93,12 +95,14 @@ class Node:
         )
         self.status = StatusWriter(state_dir / "status.json", cfg.device.id, cfg.device.site)
         self.health = HealthMonitor()
+        self.forwarder = FlaskForwarder(cfg) if cfg.flask.active else None
         self._uploader: Uploader | None = None
         self._sync: ConfigSync | None = None
         self._stop = threading.Event()
         self._recording = threading.Event()
         self._uploading = threading.Event()
         self._syncing = threading.Event()
+        self._forwarding = threading.Event()
         # Settings fetched by the sync thread, waiting to be applied by the
         # main loop.
         self._pending_settings: RemoteConfig | None = None
@@ -111,7 +115,11 @@ class Node:
     def uploader(self) -> Uploader | None:
         if self._uploader is None and self.cfg.upload.enabled:
             try:
-                self._uploader = Uploader(self.cfg, self.store)
+                self._uploader = Uploader(
+                    self.cfg,
+                    self.store,
+                    hold=self.forwarder.holds if self.forwarder else None,
+                )
             except UploadError as exc:
                 log.error("uploader disabled: %s", exc)
                 return None
@@ -143,6 +151,8 @@ class Node:
         self.sensors.close()
         if self._uploader is not None:
             self._uploader.close()
+        if self.forwarder is not None:
+            self.forwarder.close()
         self.store.close()
         self.health.notifier.close()
 
@@ -219,6 +229,8 @@ class Node:
             return
         record = self.sensors.sample()
         self.sensors.write(record)
+        if self.forwarder is not None:
+            self.forwarder.enqueue_reading(record)
         # Record what the day was configured to do, not only what happened, so
         # a day with the microphone scheduled but broken is distinguishable
         # from a day with the microphone deliberately switched off.
@@ -339,7 +351,10 @@ class Node:
             self.master.update(self.today, notes=f"analysis error: {exc}"[:120])
             return
 
-        self.analysis.write(result.as_row(self.settings.top_peaks), day=self.today)
+        row = result.as_row(self.settings.top_peaks)
+        self.analysis.write(row, day=self.today)
+        if self.forwarder is not None:
+            self.forwarder.enqueue_analysis(row)
         log.info("analysed %s: %s", path.name, result.summary())
 
         self._analysed.append(result.rms_dbfs)
@@ -548,6 +563,26 @@ class Node:
         finally:
             self._uploading.clear()
 
+    def task_forward(self) -> None:
+        """Start a pass to the Flask server in the background, as uploads do.
+
+        A recording can take minutes to send over a slow link, and the loop
+        must stay free to answer the watchdog.
+        """
+        if self.forwarder is None or self._forwarding.is_set():
+            return
+        self._forwarding.set()
+        threading.Thread(target=self._forward_once, name="flask", daemon=True).start()
+
+    def _forward_once(self) -> None:
+        """One pass to the Flask server. Runs off the main loop; must never raise into it."""
+        try:
+            self.forwarder.run_once()  # type: ignore[union-attr]
+        except Exception:
+            log.exception("flask pass failed")
+        finally:
+            self._forwarding.clear()
+
     def task_status(self) -> None:
         """Publish the snapshot the dashboard renders, and pet the watchdog."""
         # Checked here rather than in task_config because this runs every few
@@ -641,6 +676,9 @@ class Node:
             ("status", STATUS_REFRESH_S, now + 2.0),
             ("config", CONFIG_REFRESH_S, now + CONFIG_REFRESH_S),
         ]
+        if self.forwarder is not None:
+            schedule.append(("forward", cfg.flask.interval_s, now + 10.0))
+            log.info("flask server: %s (hive %d)", cfg.flask.url, cfg.flask.hive_id)
         tasks = {
             "sample": self.task_sample,
             "record": self.task_record,
@@ -648,6 +686,7 @@ class Node:
             "upload": self.task_upload,
             "status": self.task_status,
             "config": self.task_config,
+            "forward": self.task_forward,
         }
         for name, interval, _ in schedule:
             self.health.register(name, interval)
@@ -877,9 +916,11 @@ def cmd_scan(cfg: Config) -> int:
 
 def cmd_upload(cfg: Config) -> int:
     cfg.ensure_dirs()
+    # A manual drain must not delete recordings the Flask server has not had.
+    forwarder = FlaskForwarder(cfg) if cfg.flask.active else None
     with Store(cfg.state_db) as store:
         try:
-            uploader = Uploader(cfg, store)
+            uploader = Uploader(cfg, store, hold=forwarder.holds if forwarder else None)
         except UploadError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -903,6 +944,38 @@ def cmd_upload(cfg: Config) -> int:
             return 1
         finally:
             uploader.close()
+            if forwarder is not None:
+                forwarder.close()
+
+
+def cmd_forward(cfg: Config) -> int:
+    """Send everything queued for the Flask server now, and report."""
+    if not cfg.flask.active:
+        print("flask forwarding is off — set FLASK_URL in .env (see docs/FLASK-API.md)",
+              file=sys.stderr)
+        return 2
+    cfg.ensure_dirs()
+    forwarder = FlaskForwarder(cfg)
+    try:
+        print(f"flask server: {cfg.flask.url} (hive {cfg.flask.hive_id})")
+        sent = forwarder.run_once()
+        print(f"sent {sent['reading']} reading(s), {sent['analysis']} analysis row(s), "
+              f"{sent['audio']} recording(s)")
+        _print_flask_counts(forwarder)
+        if forwarder.online is False:
+            print("server unreachable — is run.py running, and port 5000 allowed through the "
+                  "Windows firewall?", file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        forwarder.close()
+
+
+def _print_flask_counts(forwarder: FlaskForwarder) -> None:
+    counts = forwarder.counts()
+    for kind in ("reading", "analysis", "audio"):
+        row = counts.get(kind, {})
+        print(f"  {kind:<9} " + (", ".join(f"{k}={v}" for k, v in sorted(row.items())) or "none"))
 
 
 def _effective_settings(cfg: Config, *, fetch: bool = False) -> RemoteConfig:
@@ -1039,6 +1112,15 @@ def cmd_status(cfg: Config) -> int:
               f"({usage.free / usage.total * 100:.0f}%)")
         print(f"i2c:      /dev/i2c-{cfg.sensors.i2c_bus} "
               f"{'present' if Path(f'/dev/i2c-{cfg.sensors.i2c_bus}').exists() else 'MISSING'}")
+        if cfg.flask.active:
+            print(f"flask:    {cfg.flask.url} (hive {cfg.flask.hive_id})")
+            forwarder = FlaskForwarder(cfg)
+            try:
+                _print_flask_counts(forwarder)
+            finally:
+                forwarder.close()
+        else:
+            print("flask:    off (FLASK_URL not set)")
 
         master = MasterLog(cfg.resolve("var/state") / "master_log.csv")
         rows = master.read()
@@ -1079,7 +1161,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="run",
         choices=[
             "run", "sample", "record", "analyse", "audio-test",
-            "scan", "upload", "config", "status", "refresh", "mic-test",
+            "scan", "upload", "forward", "config", "status", "refresh", "mic-test",
         ],
     )
     parser.add_argument("files", nargs="*", type=Path, help="analyse: WAV files to analyse")
@@ -1109,6 +1191,7 @@ def main(argv: list[str] | None = None) -> int:
         "audio-test": cmd_audio_test,
         "scan": cmd_scan,
         "upload": cmd_upload,
+        "forward": cmd_forward,
         "config": cmd_config,
         "status": cmd_status,
     }

@@ -114,6 +114,25 @@ class UploadConfig(BaseModel):
         return v
 
 
+class FlaskConfig(BaseModel):
+    """The Queen Bee Watch Flask server. Off until a url is set."""
+
+    enabled: bool = True
+    url: str = ""  # e.g. http://192.168.1.20:5000
+    api_key: str = ""  # the server's DEFAULT_HIVE_API_KEY
+    hive_id: int = 1
+    interval_s: float = 30.0
+    batch_size: int = 500  # the server refuses more than 500 readings per request
+    timeout_s: float = 10.0
+    audio_timeout_s: float = 600.0  # per recording
+    send_audio: bool = True
+    backfill: bool = True  # also send what is in the CSVs still on the card
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and bool(self.url.strip())
+
+
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     max_bytes: int = 5 * 1024 * 1024
@@ -127,6 +146,7 @@ class Config(BaseModel):
     audio: AudioConfig = Field(default_factory=AudioConfig)
     cloud: CloudConfig = Field(default_factory=CloudConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
+    flask: FlaskConfig = Field(default_factory=FlaskConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     root: Path = PROJECT_ROOT

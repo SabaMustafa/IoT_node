@@ -12,6 +12,7 @@ import logging
 import re
 import shutil
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,6 +36,7 @@ class Uploader:
         store: Store,
         backend: Backend | None = None,
         settings: RemoteConfig | None = None,
+        hold: Callable[[Path], bool] | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -42,6 +44,9 @@ class Uploader:
         # Storage policy comes from config.ini so it can be changed in the
         # field; the built-in defaults apply until the first fetch lands.
         self.settings = settings if settings is not None else RemoteConfig()
+        # Asked before deleting an uploaded file: True keeps it, because
+        # another destination (the Flask server) has not had it yet.
+        self.hold = hold
 
     def close(self) -> None:
         self.backend.close()
@@ -194,7 +199,8 @@ class Uploader:
             for row in self.store.uploaded_files():
                 if self._free_pct() >= policy.min_free_percent:
                     break
-                removed += self._purge([row])
+                # Below the floor, the card matters more than the Flask copy.
+                removed += self._purge([row], force=True)
 
         if removed:
             log.info("housekeeping removed %d uploaded file(s)", removed)
@@ -249,10 +255,12 @@ class Uploader:
                 self._free_pct(),
             )
 
-    def _purge(self, rows) -> int:
+    def _purge(self, rows, *, force: bool = False) -> int:
         count = 0
         for row in rows:
             path = Path(row["spool_path"])
+            if not force and self.hold is not None and self.hold(path):
+                continue
             try:
                 path.unlink(missing_ok=True)
                 count += 1

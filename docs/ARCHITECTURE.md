@@ -105,6 +105,7 @@ or never start, and the node will not notice.
 | [`cloud/auth.py`](../src/iot_node/cloud/auth.py), [`auth_cli.py`](../src/iot_node/cloud/auth_cli.py) | MSAL auth for the Graph path only. |
 | [`cloud/uploader.py`](../src/iot_node/cloud/uploader.py) | Drains the spool, verifies sizes, and runs housekeeping. |
 | [`cloud/config_sync.py`](../src/iot_node/cloud/config_sync.py) | Fetches `config.ini`, caches it, keeps a known-good backup, pushes the master log. |
+| [`cloud/flask_forward.py`](../src/iot_node/cloud/flask_forward.py) | Outbox and sender for the Queen Bee Watch Flask server: readings, analysis, recordings. See [FLASK-API.md](FLASK-API.md). |
 
 ### Around the code
 
@@ -121,7 +122,7 @@ or never start, and the node will not notice.
 
 ## 3. What happens, and when
 
-The loop in `Node.run()` runs six tasks on independent timers. Each is short;
+The loop in `Node.run()` runs six tasks (seven with Flask forwarding on) on independent timers. Each is short;
 none blocks the others. A task that throws is logged and retried next time.
 
 | Task | Every | What it does |
@@ -132,6 +133,7 @@ none blocks the others. A task that throws is logged and retried next time.
 | `upload` | checked every 5 min, acts on `frequency` | Drain the spool to Drive, then purge what landed. |
 | `status` | 5 s | Publish `status.json` for the screen. |
 | `config` | 1 h | Re-fetch `config.ini`; push `master_log.csv`. |
+| `forward` | `flask.interval_s` (30 s) | Only when `FLASK_URL` is set. Backfill-scan the CSVs, then drain the outbox to the Flask server. |
 
 Between tasks the loop wakes at least every 15 seconds to feed the watchdog.
 

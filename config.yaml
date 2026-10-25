@@ -100,6 +100,18 @@ upload:
   retention_days: 3 # kept this long if delete_after_upload is false
   min_free_disk_pct: 10 # below this, uploaded files are purged early
 
+flask:
+  # Queen Bee Watch, the Flask server on the Windows PC. Readings, audio
+  # analysis and recordings are sent to it as well as to Drive. Off while url is
+  # blank. Contract: docs/FLASK-API.md.
+  enabled: true
+  url: ${FLASK_URL} # e.g. http://192.168.1.20:5000
+  api_key: ${FLASK_API_KEY} # must equal DEFAULT_HIVE_API_KEY in the server's .env
+  hive_id: 1
+  interval_s: 30 # how often the outbox is drained
+  send_audio: true # recordings are held on the card until the server has them
+  backfill: true # also send rows from the CSVs still on the card
+
 logging:
   level: INFO
   max_bytes: 5242880
