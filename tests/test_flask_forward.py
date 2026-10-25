@@ -219,3 +219,27 @@ def test_drive_housekeeping_keeps_audio_flask_has_not_had(flask_cfg):
         forwarder.run_once()
         uploader.housekeep()
         assert not wav.exists()
+
+
+def test_a_recording_that_vanishes_mid_pass_is_skipped(flask_cfg, monkeypatch):
+    audio = flask_cfg.spool_dir / "audio"
+    (audio / "20261025_125215.WAV").write_bytes(b"gone")
+    (audio / "20261025_130000.WAV").write_bytes(b"RIFF....WAVE")
+    forwarder, session = make(flask_cfg)
+
+    real_stat = type(audio).stat
+
+    def stat(self, *args, **kwargs):
+        if self.name == "20261025_125215.WAV" and args == () and not kwargs:
+            raise FileNotFoundError(self)
+        return real_stat(self, *args, **kwargs)
+
+    # is_file() still sees it, then it is gone by the time it is read.
+    monkeypatch.setattr(type(audio), "is_file", lambda self: True)
+    monkeypatch.setattr(type(audio), "stat", stat)
+    sent = forwarder.run_once()
+
+    assert sent["audio"] == 1
+    assert [c["url"].rsplit("/", 1)[1] for c in session.calls if c["method"] == "PUT"] == [
+        "20261025_130000.WAV"
+    ]

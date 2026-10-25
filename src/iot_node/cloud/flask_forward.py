@@ -350,44 +350,54 @@ class FlaskForwarder:
         for path in sorted(directory.iterdir()):
             if not path.is_file() or path.suffix.lower() != ".wav":
                 continue  # .WAV.part is still being written
-            size = path.stat().st_size
-            with self._lock:
-                row = self.db.execute(
-                    "SELECT status, size FROM recordings WHERE filename = ?", (path.name,)
-                ).fetchone()
-            if row is not None and row["status"] != PENDING and row["size"] == size:
+            try:
+                outcome = self._send_recording(path)
+            except OSError as exc:
+                # Gone mid-pass: the low-disk purge dropped it. Nothing to send.
+                log.warning("flask: could not send %s: %s", path.name, exc)
                 continue
-
-            headers = {"Content-Type": "audio/wav"}
-            recorded = self.recorded_at(path.name)
-            if recorded:
-                headers["X-Recorded-At"] = recorded
-            with path.open("rb") as handle:
-                response = self._request(
-                    "PUT",
-                    f"{self.base}/recordings/{quote(path.name)}",
-                    data=handle,
-                    headers=headers,
-                    timeout=(self.fc.timeout_s, self.fc.audio_timeout_s),
-                )
-            outcome = self._outcome(response, "recordings")
-            error = None if outcome == SENT else _error_text(response)
-            if error:
-                log.warning("flask refused recording %s: %s", path.name, error)
-            with self._lock:
-                self.db.execute(
-                    "INSERT INTO recordings (filename, size, status, attempts, last_error, sent_at)"
-                    " VALUES (?, ?, ?, 1, ?, ?)"
-                    " ON CONFLICT(filename) DO UPDATE SET size = excluded.size,"
-                    "   status = excluded.status, attempts = attempts + 1,"
-                    "   last_error = excluded.last_error, sent_at = excluded.sent_at",
-                    (path.name, size, outcome, error, time.time() if outcome == SENT else None),
-                )
-                self.db.commit()
-            if outcome == SENT:
-                sent += 1
-                log.info("flask: sent %s (%.1f MiB)", path.name, size / 1048576)
+            sent += outcome == SENT
         return sent
+
+    def _send_recording(self, path: Path) -> str | None:
+        """PUT one recording unless the server already has it. Returns the outcome."""
+        size = path.stat().st_size
+        with self._lock:
+            row = self.db.execute(
+                "SELECT status, size FROM recordings WHERE filename = ?", (path.name,)
+            ).fetchone()
+        if row is not None and row["status"] != PENDING and row["size"] == size:
+            return None
+
+        headers = {"Content-Type": "audio/wav"}
+        recorded = self.recorded_at(path.name)
+        if recorded:
+            headers["X-Recorded-At"] = recorded
+        with path.open("rb") as handle:
+            response = self._request(
+                "PUT",
+                f"{self.base}/recordings/{quote(path.name)}",
+                data=handle,
+                headers=headers,
+                timeout=(self.fc.timeout_s, self.fc.audio_timeout_s),
+            )
+        outcome = self._outcome(response, "recordings")
+        error = None if outcome == SENT else _error_text(response)
+        if error:
+            log.warning("flask refused recording %s: %s", path.name, error)
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO recordings (filename, size, status, attempts, last_error, sent_at)"
+                " VALUES (?, ?, ?, 1, ?, ?)"
+                " ON CONFLICT(filename) DO UPDATE SET size = excluded.size,"
+                "   status = excluded.status, attempts = attempts + 1,"
+                "   last_error = excluded.last_error, sent_at = excluded.sent_at",
+                (path.name, size, outcome, error, time.time() if outcome == SENT else None),
+            )
+            self.db.commit()
+        if outcome == SENT:
+            log.info("flask: sent %s (%.1f MiB)", path.name, size / 1048576)
+        return outcome
 
     def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         headers = {"X-API-Key": self.fc.api_key, **kwargs.pop("headers", {})}
